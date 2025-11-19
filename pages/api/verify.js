@@ -64,7 +64,7 @@ export default async function handler(req, res) {
         ContentType: 'image/jpeg'
       }));
       
-      const documentUrl = `https://${BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${s3Key}`;
+      const documentUrl = `https://s3.${process.env.AWS_REGION}.amazonaws.com/${BUCKET}/${s3Key}`;
       
       const textractResult = await textract.send(new AnalyzeDocumentCommand({
         Document: { Bytes: imageBuffer },
@@ -124,7 +124,7 @@ export default async function handler(req, res) {
         ContentType: 'image/jpeg'
       }));
       
-      const selfieUrl = `https://${BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${selfieKey}`;
+     const selfieUrl = `https://s3.${process.env.AWS_REGION}.amazonaws.com/${BUCKET}/${selfieKey}`;
       
       const livenessResult = await rekognition.send(new DetectFacesCommand({
         Image: { Bytes: selfieBuffer },
