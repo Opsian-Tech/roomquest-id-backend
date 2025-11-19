@@ -50,9 +50,11 @@ export default async function handler(req, res) {
     }
 
     if (action === 'upload_document') {
-      const { session_token, image_base64, guest_name, room_number } = req.body;
+      const { session_token, image_data, guest_name, room_number } = req.body;
       
-      const imageBuffer = Buffer.from(image_base64, 'base64');
+      // Remove data URL prefix if present
+      const base64Data = image_data.replace(/^data:image\/\w+;base64,/, '');
+      const imageBuffer = Buffer.from(base64Data, 'base64');
       
       const s3Key = `demo/${session_token}/document.jpg`;
       await s3.send(new PutObjectCommand({
@@ -98,7 +100,7 @@ export default async function handler(req, res) {
     }
 
     if (action === 'verify_face') {
-      const { session_token, selfie_base64 } = req.body;
+      const { session_token, selfie_data } = req.body;
       
       const { data: session } = await supabase
         .from('demo_sessions')
@@ -110,7 +112,9 @@ export default async function handler(req, res) {
         return res.status(400).json({ error: 'Document not uploaded' });
       }
       
-      const selfieBuffer = Buffer.from(selfie_base64, 'base64');
+      // Remove data URL prefix if present
+      const base64Data = selfie_data.replace(/^data:image\/\w+;base64,/, '');
+      const selfieBuffer = Buffer.from(base64Data, 'base64');
       
       const selfieKey = `demo/${session_token}/selfie.jpg`;
       await s3.send(new PutObjectCommand({
