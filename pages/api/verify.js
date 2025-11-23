@@ -149,7 +149,7 @@ export default async function handler(req, res) {
       }));
       
       const face = livenessResult.FaceDetails?.[0];
-      const isLive = true;
+      const isLive = face?.EyesOpen?.Value && face?.Quality?.Brightness > 40;
       const livenessScore = (face?.Confidence || 0) / 100;
       
       const docResponse = await fetch(session.document_url);
@@ -170,7 +170,7 @@ export default async function handler(req, res) {
       const similarity = (compareResult.FaceMatches?.[0]?.Similarity || 0) / 100;
       
       const verificationScore = (isLive ? 0.4 : 0) + (livenessScore * 0.3) + (similarity * 0.3);
-      const isVerified = isLive && similarity >= 0.10;
+      const isVerified = isLive && similarity >= 0.75;
       
       await supabase
         .from('demo_sessions')
