@@ -202,6 +202,7 @@ export default async function handler(req, res) {
         .from("demo_sessions")
         .select(
           [
+            "id",
             "session_token",
             "status",
             "current_step",
@@ -217,6 +218,8 @@ export default async function handler(req, res) {
             "liveness_score",
             "face_match_score",
             "extracted_info",
+            "tm30_info",
+            "tm30_status",
             "expected_guest_count",
             "verified_guest_count",
             "requires_additional_guest",
@@ -243,6 +246,7 @@ export default async function handler(req, res) {
       return res.json({
         success: true,
         session: {
+          id: session.id ?? null,
           session_token: session.session_token,
           status: session.status ?? null,
           current_step,
@@ -263,6 +267,9 @@ export default async function handler(req, res) {
           face_match_score: session.face_match_score ?? null,
 
           extracted_info: session.extracted_info ?? null,
+
+          tm30_info: session.tm30_info ?? {},
+          tm30_status: session.tm30_status ?? "draft",
 
           expected_guest_count: expected,
           verified_guest_count: verified,
@@ -346,6 +353,58 @@ export default async function handler(req, res) {
       }
 
       return res.json({ success: true });
+    }
+
+    if (action === "tm30_update") {
+      const { session_token, id, tm30_info } = req.body || {};
+
+      const matchCol = session_token ? "session_token" : id ? "id" : null;
+      const matchVal = session_token || id || null;
+
+      if (!matchCol || !matchVal) {
+        return res.status(400).json({ error: "session_token or id required" });
+      }
+
+      const payload = tm30_info && typeof tm30_info === "object" ? tm30_info : {};
+
+      const requiredKeys = [
+        "nationality",
+        "sex",
+        "arrival_date_time",
+        "departure_date",
+        "property",
+        "room_number",
+      ];
+
+      const missing = requiredKeys.filter((k) => {
+        const v = payload[k];
+        return v === undefined || v === null || String(v).trim() === "";
+      });
+
+      const tm30_status = missing.length === 0 ? "ready" : "draft";
+
+      const { data, error } = await supabase
+        .from("demo_sessions")
+        .update({
+          tm30_info: payload,
+          tm30_status,
+          updated_at: new Date().toISOString(),
+        })
+        .eq(matchCol, matchVal)
+        .select("*")
+        .single();
+
+      if (error || !data) {
+        console.error("tm30_update error:", error);
+        return res.status(500).json({ error: error?.message || "Failed to update TM30 info" });
+      }
+
+      return res.status(200).json({
+        success: true,
+        tm30_status,
+        missing_fields: missing,
+        row: data,
+      });
     }
 
     if (action === "upload_document") {
@@ -590,7 +649,7 @@ export default async function handler(req, res) {
           face_match_score: similarity,
           verification_score: verificationScore,
           is_verified: overallVerified,
-          requires_additional_guest: requiresAdditionalGuest,
+          requires_additional_guest: requiresAdditional_guest,
           expected_guest_count: expected,
           verified_guest_count: verifiedAfter,
           remaining_guest_verifications: Math.max(expected - verifiedAfter, 0),
