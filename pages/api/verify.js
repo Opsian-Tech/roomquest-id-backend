@@ -74,6 +74,58 @@ function normalizeKey(k = "") {
   return String(k).trim().toLowerCase().replace(/\s+/g, "_");
 }
 
+function parseMrzTD3(mrz) {
+  try {
+    const clean = String(mrz || "")
+      .replace(/\r/g, "\n")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .join("")
+      .replace(/\s+/g, "")
+      .toUpperCase();
+
+    const lines =
+      clean.includes("\n")
+        ? clean.split("\n").filter(Boolean)
+        : clean.length >= 88
+        ? [clean.slice(0, 44), clean.slice(44, 88)]
+        : clean.length >= 44
+        ? [clean.slice(0, 44), clean.slice(44, 88)]
+        : [];
+
+    if (lines.length < 2) return null;
+
+    const l2 = String(lines[1] || "").padEnd(44, "<");
+
+    const passportNumberRaw = l2.slice(0, 9);
+    const passport_number = passportNumberRaw.replace(/</g, "").trim() || null;
+
+    const nationality = l2.slice(10, 13).replace(/</g, "").trim() || null;
+
+    const dob_yymmdd_raw = l2.slice(13, 19);
+    const dob_yymmdd = dob_yymmdd_raw.replace(/</g, "").trim() || null;
+
+    const sexRaw = l2.slice(20, 21);
+    const sex = sexRaw.replace(/</g, "").trim() || null;
+
+    const exp_yymmdd_raw = l2.slice(21, 27);
+    const exp_yymmdd = exp_yymmdd_raw.replace(/</g, "").trim() || null;
+
+    return {
+      passport_number,
+      nationality,
+      sex,
+      dob_yymmdd,
+      exp_yymmdd,
+      line1: lines[0] || null,
+      line2: lines[1] || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function parseAnalyzeIdFields(fields = []) {
   const raw = {};
   for (const f of fields) {
@@ -82,17 +134,23 @@ function parseAnalyzeIdFields(fields = []) {
     if (key && val) raw[key] = val;
   }
 
-  const given = raw.given_name || raw.firstname || raw.first_name || null;
-  const sur = raw.surname || raw.lastname || raw.last_name || null;
+  const first_name =
+    raw.first_name || raw.firstname || raw.given_name || raw.givenname || null;
+
+  const middle_name =
+    raw.middle_name || raw.middlename || raw.second_name || raw.secondname || null;
+
+  const last_name =
+    raw.last_name || raw.lastname || raw.surname || raw.family_name || raw.familyname || null;
 
   const full_name =
     raw.full_name ||
     raw.name ||
-    (given || sur ? [given, sur].filter(Boolean).join(" ") : null) ||
-    null;
+    ([first_name, middle_name, last_name].filter(Boolean).join(" ") || null);
 
   const dob = raw.date_of_birth || raw.dob || null;
-  const nationality = raw.nationality || raw.country || null;
+  const date_of_issue = raw.date_of_issue || raw.issue_date || null;
+  const expiration_date = raw.expiration_date || raw.expiry_date || raw.expiry || null;
 
   const document_number =
     raw.document_number ||
@@ -102,11 +160,36 @@ function parseAnalyzeIdFields(fields = []) {
     raw.personal_number ||
     null;
 
+  const id_type = raw.id_type || null;
+  const mrz_code = raw.mrz_code || raw.mrz || null;
+
+  const sex = raw.sex || raw.gender || null;
+  let nationality = raw.nationality || raw.country || null;
+
+  const mrz_parsed = mrz_code ? parseMrzTD3(mrz_code) : null;
+
+  if (!nationality && mrz_parsed?.nationality) nationality = mrz_parsed.nationality;
+  const sexFinal = sex || mrz_parsed?.sex || null;
+
+  const documentNumberFinal = document_number || mrz_parsed?.passport_number || null;
+  const dobFinal = dob || mrz_parsed?.dob_yymmdd || null;
+  const expirationFinal = expiration_date || mrz_parsed?.exp_yymmdd || null;
+
   return {
-    full_name,
+    text: null,
+    id_type,
+    document_number: documentNumberFinal,
+    last_name,
+    first_name,
+    middle_name,
+    date_of_birth: dobFinal,
+    date_of_issue,
+    expiration_date: expirationFinal,
     nationality,
-    dob,
-    document_number,
+    sex: sexFinal,
+    mrz_code,
+    mrz_parsed,
+    full_name,
     raw,
   };
 }
@@ -310,12 +393,14 @@ export default async function handler(req, res) {
     }
 
     if (action === "update_guest") {
-      const { session_token, guest_name, booking_ref, room_number, expected_guest_count } = req.body || {};
+      const { session_token, guest_name, booking_ref, room_number, expected_guest_count } =
+        req.body || {};
       if (!session_token) return res.status(400).json({ error: "Session token required" });
 
       const bookingValue = booking_ref || room_number || null;
       const expectedOverride = toIntOrNull(expected_guest_count);
-      const expectedToSet = expectedOverride === null ? undefined : clampInt(expectedOverride, 1, 10);
+      const expectedToSet =
+        expectedOverride === null ? undefined : clampInt(expectedOverride, 1, 10);
 
       const updatePayload = {
         guest_name: guest_name || null,
@@ -404,7 +489,8 @@ export default async function handler(req, res) {
 
       if (!session_token) return res.status(400).json({ error: "Session token required" });
       if (!image_data) return res.status(400).json({ error: "image_data required" });
-      if (!AWS_REGION || !BUCKET) return res.status(500).json({ error: "Server misconfigured: missing AWS env vars" });
+      if (!AWS_REGION || !BUCKET)
+        return res.status(500).json({ error: "Server misconfigured: missing AWS env vars" });
 
       const base64Data = normalizeBase64(image_data);
       if (!base64Data) return res.status(400).json({ error: "Invalid image_data format" });
@@ -452,12 +538,18 @@ export default async function handler(req, res) {
         .then(async (result) => {
           if (result.ok) {
             const extracted = result.data;
+
             const extractedText =
               [
                 extracted.full_name ? `Name: ${extracted.full_name}` : null,
+                extracted.first_name ? `First: ${extracted.first_name}` : null,
+                extracted.middle_name ? `Middle: ${extracted.middle_name}` : null,
+                extracted.last_name ? `Last: ${extracted.last_name}` : null,
+                extracted.sex ? `Sex: ${extracted.sex}` : null,
                 extracted.nationality ? `Nationality: ${extracted.nationality}` : null,
-                extracted.dob ? `DOB: ${extracted.dob}` : null,
+                extracted.date_of_birth ? `DOB: ${extracted.date_of_birth}` : null,
                 extracted.document_number ? `Doc#: ${extracted.document_number}` : null,
+                extracted.expiration_date ? `Exp: ${extracted.expiration_date}` : null,
               ]
                 .filter(Boolean)
                 .join(" | ") || "Textract extracted fields";
@@ -505,7 +597,8 @@ export default async function handler(req, res) {
 
       if (!session_token) return res.status(400).json({ error: "Session token required" });
       if (!selfie_data) return res.status(400).json({ error: "selfie_data required" });
-      if (!AWS_REGION || !BUCKET) return res.status(500).json({ error: "Server misconfigured: missing AWS env vars" });
+      if (!AWS_REGION || !BUCKET)
+        return res.status(500).json({ error: "Server misconfigured: missing AWS env vars" });
 
       const { data: session, error: sessionError } = await supabase
         .from("demo_sessions")
