@@ -53,6 +53,22 @@ function normalizeBase64(base64OrDataUrl) {
   return base64OrDataUrl;
 }
 
+// ✅ NEW: Normalize guest name and reservation number for email match
+function normalizeGuestName(name) {
+  return String(name || "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, "");
+}
+
+function normalizeReservationNumber(v) {
+  return String(v || "")
+    .toUpperCase()
+    .trim()
+    .replace(/[\s-]/g, "");
+}
+
 function inferStepFromSession(session) {
   if (!session) return "welcome";
   if (session?.current_step) return session.current_step;
@@ -398,6 +414,34 @@ export default async function handler(req, res) {
       if (!session_token) return res.status(400).json({ error: "Session token required" });
 
       const bookingValue = booking_ref || room_number || null;
+
+      // ✅ NEW: email-based reservation verification gate
+      if (!guest_name || !bookingValue) {
+        return res.status(400).json({ error: "Guest name and reservation number are required" });
+      }
+
+      const guestNameNorm = normalizeGuestName(guest_name);
+      const resNorm = normalizeReservationNumber(bookingValue);
+
+      const { data: matches, error: matchErr } = await supabase
+        .from("booking_email_index")
+        .select("id")
+        .eq("guest_name_norm", guestNameNorm)
+        .or(`confirmation_number_norm.eq.${resNorm},source_reservation_id_norm.eq.${resNorm}`)
+        .limit(1);
+
+      if (matchErr) {
+        console.error("booking_email_index lookup error:", matchErr);
+        return res.status(500).json({ error: "Failed to verify reservation" });
+      }
+
+      if (!matches || matches.length === 0) {
+        return res.status(403).json({
+          error:
+            "Reservation not found. Please enter your name and reservation number exactly as shown in your confirmation email.",
+        });
+      }
+
       const expectedOverride = toIntOrNull(expected_guest_count);
       const expectedToSet =
         expectedOverride === null ? undefined : clampInt(expectedOverride, 1, 10);
