@@ -437,6 +437,12 @@ export default async function handler(req, res) {
       const adultsFromEmail = Number.isFinite(Number(bookingRow.adults))
         ? Number(bookingRow.adults)
         : 1;
+
+      const childrenFromEmail = Number.isFinite(Number(bookingRow.children))
+        ? Number(bookingRow.children)
+        : 0;
+
+      // Policy: verify adults only
       const expectedFromEmail = clampInt(adultsFromEmail, 1, 10);
 
       const expectedOverride = toIntOrNull(expected_guest_count);
@@ -454,6 +460,11 @@ export default async function handler(req, res) {
       const updatePayload = {
         guest_name: guest_name || null,
         room_number: bookingValue,
+
+        // store occupancy context (even if children not verified)
+        adults: clampInt(adultsFromEmail, 0, 10),
+        children: clampInt(childrenFromEmail, 0, 10),
+
         status: "guest_info_saved",
         current_step: "document",
         expected_guest_count: expectedToSet,
@@ -473,6 +484,8 @@ export default async function handler(req, res) {
 
       return res.json({
         success: true,
+        adults: clampInt(adultsFromEmail, 0, 10),
+        children: clampInt(childrenFromEmail, 0, 10),
         expected_guest_count: expectedToSet,
         verified_guest_count: verified,
         requires_additional_guest: verified < expectedToSet,
@@ -534,7 +547,6 @@ export default async function handler(req, res) {
       if (!AWS_REGION || !BUCKET)
         return res.status(500).json({ error: "Server misconfigured: missing AWS env vars" });
 
-      // ✅ Gate: must have completed Step 1 (reservation verification)
       const { data: sess, error: sessErr } = await supabase
         .from("demo_sessions")
         .select("guest_name, room_number, expected_guest_count, verified_guest_count")
@@ -548,8 +560,6 @@ export default async function handler(req, res) {
 
       const expected = clampInt(sess.expected_guest_count, 1, 10);
       const verifiedBefore = clampInt(sess.verified_guest_count, 0, 10);
-
-      // ✅ Current guest index = next person to verify
       const guestIndex = clampInt(verifiedBefore + 1, 1, expected);
 
       const base64Data = normalizeBase64(image_data);
@@ -558,7 +568,6 @@ export default async function handler(req, res) {
       const imageBuffer = Buffer.from(base64Data, "base64");
       if (imageBuffer.length < 1000) return res.status(400).json({ error: "Image too small" });
 
-      // ✅ Save per-guest document
       const s3Key = `demo/${session_token}/document_${guestIndex}.jpg`;
 
       await s3.send(
@@ -577,7 +586,7 @@ export default async function handler(req, res) {
         .update({
           status: "document_uploaded",
           current_step: "selfie",
-          document_url: documentUrl, // keep latest for UI/debug
+          document_url: documentUrl,
           extracted_info: {
             text: `Textract pending (async) [guest ${guestIndex}]`,
             textract_ok: null,
@@ -651,7 +660,10 @@ export default async function handler(req, res) {
         success: true,
         guest_index: guestIndex,
         extracted_text: `Textract pending (async) [guest ${guestIndex}]`,
-        data: { extracted_text: `Textract pending (async) [guest ${guestIndex}]`, guest_index: guestIndex },
+        data: {
+          extracted_text: `Textract pending (async) [guest ${guestIndex}]`,
+          guest_index: guestIndex,
+        },
       });
     }
 
@@ -673,11 +685,8 @@ export default async function handler(req, res) {
 
       const expected = clampInt(session.expected_guest_count, 1, 10);
       const verifiedBefore = clampInt(session.verified_guest_count, 0, 10);
-
-      // ✅ This guest index must match the document index
       const guestIndex = clampInt(verifiedBefore + 1, 1, expected);
 
-      // ✅ Ensure the per-guest document exists / is readable
       const docKey = `demo/${session_token}/document_${guestIndex}.jpg`;
 
       let docBuffer;
@@ -691,7 +700,7 @@ export default async function handler(req, res) {
         const docStream = docObj.Body;
         if (!docStream) return res.status(500).json({ error: "Failed to read document from S3" });
         docBuffer = await streamToBuffer(docStream);
-      } catch (e) {
+      } catch {
         return res.status(400).json({
           error: `Document not uploaded for guest ${guestIndex}. Please upload the ID first.`,
         });
@@ -738,26 +747,26 @@ export default async function handler(req, res) {
       const similarity = (compareResult.FaceMatches?.[0]?.Similarity || 0) / 100;
 
       const verificationScore = (isLive ? 0.4 : 0) + livenessScore * 0.3 + similarity * 0.3;
-      const isVerified = isLive && similarity >= 0.65;
+      const guest_verified = isLive && similarity >= 0.65;
 
       let verifiedAfter = verifiedBefore;
-      if (isVerified) verifiedAfter = Math.min(verifiedBefore + 1, expected);
+      if (guest_verified) verifiedAfter = Math.min(verifiedBefore + 1, expected);
 
       const requiresAdditionalGuest = verifiedAfter < expected;
 
       let statusToSet = "failed";
-      if (isVerified && requiresAdditionalGuest) statusToSet = "partial_verified";
-      if (isVerified && !requiresAdditionalGuest) statusToSet = "verified";
+      if (guest_verified && requiresAdditionalGuest) statusToSet = "partial_verified";
+      if (guest_verified && !requiresAdditionalGuest) statusToSet = "verified";
 
-      const overallVerified = isVerified && !requiresAdditionalGuest;
+      const overallVerified = guest_verified && !requiresAdditionalGuest;
 
       const { error: updateError } = await supabase
         .from("demo_sessions")
         .update({
           status: statusToSet,
           current_step: "results",
-          selfie_url: selfieUrl, // keep latest for UI/debug
-          document_url: `s3://${BUCKET}/${docKey}`, // keep latest for UI/debug
+          selfie_url: selfieUrl,
+          document_url: `s3://${BUCKET}/${docKey}`,
           is_verified: overallVerified,
           verification_score: verificationScore,
           liveness_score: livenessScore,
@@ -795,13 +804,24 @@ export default async function handler(req, res) {
       return res.json({
         success: true,
         guest_index: guestIndex,
+
+        // critical: per-guest result (Lovable must use this; NEVER fallback to is_verified)
+        guest_verified,
+        advance_to_next_guest: guest_verified,
+        status: statusToSet,
+
+        // session-level
         is_verified: overallVerified,
         expected_guest_count: expected,
         verified_guest_count: verifiedAfter,
         requires_additional_guest: requiresAdditionalGuest,
         remaining_guest_verifications: Math.max(expected - verifiedAfter, 0),
+
         data: {
           guest_index: guestIndex,
+          guest_verified,
+          advance_to_next_guest: guest_verified,
+          status: statusToSet,
           liveness_score: livenessScore,
           face_match_score: similarity,
           verification_score: verificationScore,
