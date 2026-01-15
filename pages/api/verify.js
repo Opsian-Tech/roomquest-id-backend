@@ -1,3 +1,4 @@
+```js
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
@@ -62,10 +63,7 @@ function normalizeGuestName(name) {
 }
 
 function normalizeReservationNumber(v) {
-  return String(v || "")
-    .toUpperCase()
-    .trim()
-    .replace(/[\s-]/g, "");
+  return String(v || "").toUpperCase().trim().replace(/[\s-]/g, "");
 }
 
 function inferStepFromSession(session) {
@@ -260,6 +258,7 @@ export default async function handler(req, res) {
 
     if (action === "start") {
       const token = generateToken();
+
       const expected_guest_count = 1;
       const verified_guest_count = 0;
       const requires_additional_guest = expected_guest_count > verified_guest_count;
@@ -301,6 +300,8 @@ export default async function handler(req, res) {
             "consent_locale",
             "guest_name",
             "room_number",
+            "adults",
+            "children",
             "document_url",
             "selfie_url",
             "is_verified",
@@ -346,6 +347,9 @@ export default async function handler(req, res) {
 
           guest_name: session.guest_name ?? null,
           room_number: session.room_number ?? null,
+
+          adults: session.adults ?? null,
+          children: session.children ?? null,
 
           document_uploaded: Boolean(session.document_url),
           selfie_uploaded: Boolean(session.selfie_url),
@@ -434,6 +438,7 @@ export default async function handler(req, res) {
       }
 
       const bookingRow = matches[0];
+
       const adultsFromEmail = Number.isFinite(Number(bookingRow.adults))
         ? Number(bookingRow.adults)
         : 1;
@@ -442,7 +447,7 @@ export default async function handler(req, res) {
         ? Number(bookingRow.children)
         : 0;
 
-      // Policy: verify adults only
+      // ✅ POLICY: verify adults only (store children for context)
       const expectedFromEmail = clampInt(adultsFromEmail, 1, 10);
 
       const expectedOverride = toIntOrNull(expected_guest_count);
@@ -461,7 +466,6 @@ export default async function handler(req, res) {
         guest_name: guest_name || null,
         room_number: bookingValue,
 
-        // store occupancy context (even if children not verified)
         adults: clampInt(adultsFromEmail, 0, 10),
         children: clampInt(childrenFromEmail, 0, 10),
 
@@ -547,6 +551,7 @@ export default async function handler(req, res) {
       if (!AWS_REGION || !BUCKET)
         return res.status(500).json({ error: "Server misconfigured: missing AWS env vars" });
 
+      // ✅ Gate: must have completed Step 1
       const { data: sess, error: sessErr } = await supabase
         .from("demo_sessions")
         .select("guest_name, room_number, expected_guest_count, verified_guest_count")
@@ -560,6 +565,8 @@ export default async function handler(req, res) {
 
       const expected = clampInt(sess.expected_guest_count, 1, 10);
       const verifiedBefore = clampInt(sess.verified_guest_count, 0, 10);
+
+      // ✅ next guest to verify
       const guestIndex = clampInt(verifiedBefore + 1, 1, expected);
 
       const base64Data = normalizeBase64(image_data);
@@ -586,7 +593,7 @@ export default async function handler(req, res) {
         .update({
           status: "document_uploaded",
           current_step: "selfie",
-          document_url: documentUrl,
+          document_url: documentUrl, // latest document for UI/debug
           extracted_info: {
             text: `Textract pending (async) [guest ${guestIndex}]`,
             textract_ok: null,
@@ -687,6 +694,7 @@ export default async function handler(req, res) {
       const verifiedBefore = clampInt(session.verified_guest_count, 0, 10);
       const guestIndex = clampInt(verifiedBefore + 1, 1, expected);
 
+      // ✅ must match the per-guest doc
       const docKey = `demo/${session_token}/document_${guestIndex}.jpg`;
 
       let docBuffer;
@@ -747,6 +755,8 @@ export default async function handler(req, res) {
       const similarity = (compareResult.FaceMatches?.[0]?.Similarity || 0) / 100;
 
       const verificationScore = (isLive ? 0.4 : 0) + livenessScore * 0.3 + similarity * 0.3;
+
+      // ✅ per-guest result (what Lovable should use to advance)
       const guest_verified = isLive && similarity >= 0.65;
 
       let verifiedAfter = verifiedBefore;
@@ -758,22 +768,38 @@ export default async function handler(req, res) {
       if (guest_verified && requiresAdditionalGuest) statusToSet = "partial_verified";
       if (guest_verified && !requiresAdditionalGuest) statusToSet = "verified";
 
-      const overallVerified = guest_verified && !requiresAdditionalGuest;
+      // ✅ session-level overall verified = all guests verified
+      const overallVerified = verifiedAfter >= expected;
+
+      // ✅ IMPORTANT: set next step to avoid “guest 1 selfie loop”
+      // If guest passed and more guests remain -> next step is document (guest 2 upload)
+      // If guest passed and done -> results
+      // If guest failed -> selfie
+      const next_step = guest_verified
+        ? requiresAdditionalGuest
+          ? "document"
+          : "results"
+        : "selfie";
 
       const { error: updateError } = await supabase
         .from("demo_sessions")
         .update({
           status: statusToSet,
-          current_step: "results",
+          current_step: next_step,
+
+          // keep latest assets for UI/debug
           selfie_url: selfieUrl,
           document_url: `s3://${BUCKET}/${docKey}`,
+
           is_verified: overallVerified,
           verification_score: verificationScore,
           liveness_score: livenessScore,
           face_match_score: similarity,
+
           expected_guest_count: expected,
           verified_guest_count: verifiedAfter,
           requires_additional_guest: requiresAdditionalGuest,
+
           updated_at: new Date().toISOString(),
         })
         .eq("session_token", session_token);
@@ -805,10 +831,11 @@ export default async function handler(req, res) {
         success: true,
         guest_index: guestIndex,
 
-        // critical: per-guest result (Lovable must use this; NEVER fallback to is_verified)
+        // ✅ critical per-guest signals (Lovable must use these)
         guest_verified,
         advance_to_next_guest: guest_verified,
         status: statusToSet,
+        next_step,
 
         // session-level
         is_verified: overallVerified,
@@ -822,9 +849,12 @@ export default async function handler(req, res) {
           guest_verified,
           advance_to_next_guest: guest_verified,
           status: statusToSet,
+          next_step,
+
           liveness_score: livenessScore,
           face_match_score: similarity,
           verification_score: verificationScore,
+
           is_verified: overallVerified,
           requires_additional_guest: requiresAdditionalGuest,
           expected_guest_count: expected,
@@ -840,3 +870,4 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: error?.message || "Unknown server error" });
   }
 }
+```
