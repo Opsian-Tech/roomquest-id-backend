@@ -1,4 +1,3 @@
-```js
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
@@ -870,4 +869,3 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: error?.message || "Unknown server error" });
   }
 }
-```
