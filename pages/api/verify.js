@@ -65,6 +65,11 @@ function normalizeReservationNumber(v) {
   return String(v || "").toUpperCase().trim().replace(/[\s-]/g, "");
 }
 
+function normalizeFlowType(v) {
+  const s = String(v || "").trim().toLowerCase();
+  return s === "visitor" ? "visitor" : "guest";
+}
+
 function inferStepFromSession(session) {
   if (!session) return "welcome";
   if (session?.current_step) return session.current_step;
@@ -72,7 +77,16 @@ function inferStepFromSession(session) {
   if (session?.is_verified === true || session?.verification_score != null) return "results";
   if (session?.selfie_url) return "results";
   if (session?.document_url) return "selfie";
-  if (session?.guest_name || session?.room_number) return "document";
+
+  const hasGuestStep1 = Boolean(session?.guest_name && session?.room_number);
+  const hasVisitorStep1 = Boolean(
+    session?.visitor_first_name &&
+      session?.visitor_last_name &&
+      session?.visitor_phone &&
+      session?.visitor_reason
+  );
+
+  if (hasGuestStep1 || hasVisitorStep1) return "document";
   return "welcome";
 }
 
@@ -257,6 +271,7 @@ export default async function handler(req, res) {
 
     if (action === "start") {
       const token = generateToken();
+      const flow_type = normalizeFlowType(req.body?.flow_type);
 
       const expected_guest_count = 1;
       const verified_guest_count = 0;
@@ -264,6 +279,7 @@ export default async function handler(req, res) {
 
       const { error } = await supabase.from("demo_sessions").insert({
         session_token: token,
+        flow_type,
         status: "started",
         current_step: "welcome",
         expected_guest_count,
@@ -279,6 +295,7 @@ export default async function handler(req, res) {
 
       return res.json({
         session_token: token,
+        flow_type,
         verify_url: `/verify/${token}`,
       });
     }
@@ -292,6 +309,7 @@ export default async function handler(req, res) {
         .select(
           [
             "session_token",
+            "flow_type",
             "status",
             "current_step",
             "consent_given",
@@ -301,6 +319,12 @@ export default async function handler(req, res) {
             "room_number",
             "adults",
             "children",
+
+            "visitor_first_name",
+            "visitor_last_name",
+            "visitor_phone",
+            "visitor_reason",
+
             "document_url",
             "selfie_url",
             "is_verified",
@@ -322,6 +346,7 @@ export default async function handler(req, res) {
 
       if (error || !session) return res.status(404).json({ error: "Session not found" });
 
+      const flow_type = normalizeFlowType(session.flow_type);
       const current_step = inferStepFromSession(session);
       const expected = clampInt(session.expected_guest_count, 1, 10);
       const verified = clampInt(session.verified_guest_count, 0, 10);
@@ -337,6 +362,7 @@ export default async function handler(req, res) {
         success: true,
         session: {
           session_token: session.session_token,
+          flow_type,
           status: session.status ?? null,
           current_step,
 
@@ -346,6 +372,11 @@ export default async function handler(req, res) {
 
           guest_name: session.guest_name ?? null,
           room_number: session.room_number ?? null,
+
+          visitor_first_name: session.visitor_first_name ?? null,
+          visitor_last_name: session.visitor_last_name ?? null,
+          visitor_phone: session.visitor_phone ?? null,
+          visitor_reason: session.visitor_reason ?? null,
 
           adults: session.adults ?? null,
           children: session.children ?? null,
@@ -404,9 +435,85 @@ export default async function handler(req, res) {
     }
 
     if (action === "update_guest") {
-      const { session_token, guest_name, booking_ref, room_number, expected_guest_count } =
-        req.body || {};
+      const {
+        session_token,
+
+        flow_type: flowTypeFromBody,
+
+        // guest fields
+        guest_name,
+        booking_ref,
+        room_number,
+        expected_guest_count,
+
+        // visitor fields
+        visitor_first_name,
+        visitor_last_name,
+        visitor_phone,
+        visitor_reason,
+      } = req.body || {};
+
       if (!session_token) return res.status(400).json({ error: "Session token required" });
+
+      const { data: sess, error: sessErr } = await supabase
+        .from("demo_sessions")
+        .select("flow_type, verified_guest_count, expected_guest_count")
+        .eq("session_token", session_token)
+        .single();
+
+      if (sessErr || !sess) return res.status(404).json({ error: "Session not found" });
+
+      const flow_type = normalizeFlowType(flowTypeFromBody || sess.flow_type);
+
+      if (flow_type === "visitor") {
+        const vf = String(visitor_first_name || "").trim();
+        const vl = String(visitor_last_name || "").trim();
+        const vp = String(visitor_phone || "").trim();
+        const vr = String(visitor_reason || "").trim();
+
+        if (!vf || !vl || !vp || !vr) {
+          return res.status(400).json({
+            error: "Visitor first name, last name, phone number, and reason for visiting are required",
+          });
+        }
+
+        const expectedToSet = 1;
+        const verified = clampInt(sess.verified_guest_count, 0, 10);
+
+        const { error: updateError } = await supabase
+          .from("demo_sessions")
+          .update({
+            flow_type: "visitor",
+
+            visitor_first_name: vf,
+            visitor_last_name: vl,
+            visitor_phone: vp,
+            visitor_reason: vr,
+
+            status: "visitor_info_saved",
+            current_step: "document",
+
+            expected_guest_count: expectedToSet,
+            requires_additional_guest: verified < expectedToSet,
+
+            updated_at: new Date().toISOString(),
+          })
+          .eq("session_token", session_token);
+
+        if (updateError) {
+          console.error("Error saving visitor info:", updateError);
+          return res.status(500).json({ error: "Failed to save visitor info" });
+        }
+
+        return res.json({
+          success: true,
+          flow_type: "visitor",
+          expected_guest_count: expectedToSet,
+          verified_guest_count: verified,
+          requires_additional_guest: verified < expectedToSet,
+          remaining_guest_verifications: Math.max(expectedToSet - verified, 0),
+        });
+      }
 
       const bookingValue = booking_ref || room_number || null;
 
@@ -446,22 +553,16 @@ export default async function handler(req, res) {
         ? Number(bookingRow.children)
         : 0;
 
-      // ✅ POLICY: verify adults only (store children for context)
       const expectedFromEmail = clampInt(adultsFromEmail, 1, 10);
 
       const expectedOverride = toIntOrNull(expected_guest_count);
       const expectedToSet =
         expectedOverride === null ? expectedFromEmail : clampInt(expectedOverride, 1, 10);
 
-      const { data: s, error: sErr } = await supabase
-        .from("demo_sessions")
-        .select("verified_guest_count")
-        .eq("session_token", session_token)
-        .single();
-
-      const verified = !sErr && s ? clampInt(s.verified_guest_count, 0, 10) : 0;
+      const verified = clampInt(sess.verified_guest_count, 0, 10);
 
       const updatePayload = {
+        flow_type: "guest",
         guest_name: guest_name || null,
         room_number: bookingValue,
 
@@ -487,6 +588,7 @@ export default async function handler(req, res) {
 
       return res.json({
         success: true,
+        flow_type: "guest",
         adults: clampInt(adultsFromEmail, 0, 10),
         children: clampInt(childrenFromEmail, 0, 10),
         expected_guest_count: expectedToSet,
@@ -550,22 +652,47 @@ export default async function handler(req, res) {
       if (!AWS_REGION || !BUCKET)
         return res.status(500).json({ error: "Server misconfigured: missing AWS env vars" });
 
-      // ✅ Gate: must have completed Step 1
+      // Gate: must have completed Step 1 (guest OR visitor)
       const { data: sess, error: sessErr } = await supabase
         .from("demo_sessions")
-        .select("guest_name, room_number, expected_guest_count, verified_guest_count")
+        .select(
+          [
+            "flow_type",
+            "guest_name",
+            "room_number",
+            "visitor_first_name",
+            "visitor_last_name",
+            "visitor_phone",
+            "visitor_reason",
+            "expected_guest_count",
+            "verified_guest_count",
+          ].join(",")
+        )
         .eq("session_token", session_token)
         .single();
 
       if (sessErr || !sess) return res.status(404).json({ error: "Session not found" });
-      if (!sess.guest_name || !sess.room_number) {
-        return res.status(403).json({ error: "Complete Step 1 (reservation verification) first." });
+
+      const flow_type = normalizeFlowType(sess.flow_type);
+
+      const hasGuestStep1 = Boolean(sess.guest_name && sess.room_number);
+      const hasVisitorStep1 = Boolean(
+        sess.visitor_first_name && sess.visitor_last_name && sess.visitor_phone && sess.visitor_reason
+      );
+
+      if (flow_type === "visitor") {
+        if (!hasVisitorStep1) {
+          return res.status(403).json({ error: "Complete Step 1 (visitor info) first." });
+        }
+      } else {
+        if (!hasGuestStep1) {
+          return res.status(403).json({ error: "Complete Step 1 (reservation verification) first." });
+        }
       }
 
       const expected = clampInt(sess.expected_guest_count, 1, 10);
       const verifiedBefore = clampInt(sess.verified_guest_count, 0, 10);
 
-      // ✅ next guest to verify
       const guestIndex = clampInt(verifiedBefore + 1, 1, expected);
 
       const base64Data = normalizeBase64(image_data);
@@ -592,7 +719,7 @@ export default async function handler(req, res) {
         .update({
           status: "document_uploaded",
           current_step: "selfie",
-          document_url: documentUrl, // latest document for UI/debug
+          document_url: documentUrl,
           extracted_info: {
             text: `Textract pending (async) [guest ${guestIndex}]`,
             textract_ok: null,
@@ -664,11 +791,13 @@ export default async function handler(req, res) {
 
       return res.json({
         success: true,
+        flow_type,
         guest_index: guestIndex,
         extracted_text: `Textract pending (async) [guest ${guestIndex}]`,
         data: {
           extracted_text: `Textract pending (async) [guest ${guestIndex}]`,
           guest_index: guestIndex,
+          flow_type,
         },
       });
     }
@@ -689,11 +818,12 @@ export default async function handler(req, res) {
 
       if (sessionError || !session) return res.status(404).json({ error: "Session not found" });
 
+      const flow_type = normalizeFlowType(session.flow_type);
+
       const expected = clampInt(session.expected_guest_count, 1, 10);
       const verifiedBefore = clampInt(session.verified_guest_count, 0, 10);
       const guestIndex = clampInt(verifiedBefore + 1, 1, expected);
 
-      // ✅ must match the per-guest doc
       const docKey = `demo/${session_token}/document_${guestIndex}.jpg`;
 
       let docBuffer;
@@ -755,7 +885,6 @@ export default async function handler(req, res) {
 
       const verificationScore = (isLive ? 0.4 : 0) + livenessScore * 0.3 + similarity * 0.3;
 
-      // ✅ per-guest result (what Lovable should use to advance)
       const guest_verified = isLive && similarity >= 0.65;
 
       let verifiedAfter = verifiedBefore;
@@ -767,13 +896,8 @@ export default async function handler(req, res) {
       if (guest_verified && requiresAdditionalGuest) statusToSet = "partial_verified";
       if (guest_verified && !requiresAdditionalGuest) statusToSet = "verified";
 
-      // ✅ session-level overall verified = all guests verified
       const overallVerified = verifiedAfter >= expected;
 
-      // ✅ IMPORTANT: set next step to avoid “guest 1 selfie loop”
-      // If guest passed and more guests remain -> next step is document (guest 2 upload)
-      // If guest passed and done -> results
-      // If guest failed -> selfie
       const next_step = guest_verified
         ? requiresAdditionalGuest
           ? "document"
@@ -786,7 +910,6 @@ export default async function handler(req, res) {
           status: statusToSet,
           current_step: next_step,
 
-          // keep latest assets for UI/debug
           selfie_url: selfieUrl,
           document_url: `s3://${BUCKET}/${docKey}`,
 
@@ -826,24 +949,30 @@ export default async function handler(req, res) {
         console.warn("increment_demo_stats failed (non-blocking):", e?.message || e);
       }
 
+      const access_code =
+        flow_type === "visitor" && overallVerified ? "454545" : null;
+
       return res.json({
         success: true,
+        flow_type,
         guest_index: guestIndex,
 
-        // ✅ critical per-guest signals (Lovable must use these)
         guest_verified,
         advance_to_next_guest: guest_verified,
         status: statusToSet,
         next_step,
 
-        // session-level
         is_verified: overallVerified,
         expected_guest_count: expected,
         verified_guest_count: verifiedAfter,
         requires_additional_guest: requiresAdditionalGuest,
         remaining_guest_verifications: Math.max(expected - verifiedAfter, 0),
 
+        access_code,
+        access_duration_minutes: access_code ? 30 : null,
+
         data: {
+          flow_type,
           guest_index: guestIndex,
           guest_verified,
           advance_to_next_guest: guest_verified,
@@ -859,6 +988,9 @@ export default async function handler(req, res) {
           expected_guest_count: expected,
           verified_guest_count: verifiedAfter,
           remaining_guest_verifications: Math.max(expected - verifiedAfter, 0),
+
+          access_code,
+          access_duration_minutes: access_code ? 30 : null,
         },
       });
     }
