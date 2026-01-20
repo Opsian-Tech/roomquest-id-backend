@@ -265,6 +265,96 @@ function clampInt(n, min, max) {
   return Math.min(Math.max(x, min), max);
 }
 
+function getBangkokNowParts(timezone = "Asia/Bangkok") {
+  const d = new Date();
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    hour12: false,
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+
+  const parts = fmt.formatToParts(d);
+  const get = (type) => parts.find((p) => p.type === type)?.value;
+
+  const weekday = get("weekday"); // e.g. Mon, Tue
+  const hour = Number(get("hour"));
+  const minute = Number(get("minute"));
+
+  const dowMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  const dow = dowMap[weekday] ?? 0;
+
+  const minutesSinceMidnight = hour * 60 + minute;
+
+  return { now: d, dow, minutesSinceMidnight };
+}
+
+function computeWindowExpiresAt(timezone = "Asia/Bangkok", endMin) {
+  // We cannot reliably create a true timezone-aware Date without a library,
+  // so we store expires_at as "now + delta minutes until end of window" which is sufficient for UI.
+  const { minutesSinceMidnight } = getBangkokNowParts(timezone);
+  let delta = endMin - minutesSinceMidnight;
+  if (delta <= 0) delta += 24 * 60;
+  return new Date(Date.now() + delta * 60 * 1000);
+}
+
+async function getActiveKioskConfig() {
+  const { data, error } = await supabase
+    .from("kiosk_config")
+    .select("property_external_id, door_key, timezone, is_active, kiosk_key")
+    .eq("kiosk_key", "visitor_kiosk")
+    .eq("is_active", true)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw new Error(`kiosk_config lookup failed: ${error.message}`);
+  if (!data) throw new Error("kiosk_config missing: create visitor_kiosk row in Supabase");
+  return {
+    property_external_id: String(data.property_external_id),
+    door_key: String(data.door_key || "main_door"),
+    timezone: String(data.timezone || "Asia/Bangkok"),
+  };
+}
+
+async function resolveScheduledDoorCode({ property_external_id, door_key, timezone }) {
+  const { dow, minutesSinceMidnight } = getBangkokNowParts(timezone || "Asia/Bangkok");
+
+  const { data, error } = await supabase
+    .from("door_code_schedule")
+    .select("access_code, start_min, end_min, dow, start_time, end_time")
+    .eq("property_external_id", property_external_id)
+    .eq("door_key", door_key)
+    .eq("dow", dow)
+    .eq("is_active", true)
+    .order("start_min", { ascending: true });
+
+  if (error) throw new Error(`door_code_schedule query failed: ${error.message}`);
+  if (!data || data.length === 0) return null;
+
+  const nowMin = minutesSinceMidnight;
+
+  const match = data.find((r) => {
+    const start = Number(r.start_min);
+    const end = Number(r.end_min);
+
+    if (start === end) return true; // treat as all-day
+    if (end > start) return nowMin >= start && nowMin < end; // normal window
+    return nowMin >= start || nowMin < end; // overnight window
+  });
+
+  return match
+    ? {
+        access_code: String(match.access_code),
+        start_min: Number(match.start_min),
+        end_min: Number(match.end_min),
+      }
+    : null;
+}
+
 export default async function handler(req, res) {
   setCors(res);
 
@@ -292,6 +382,11 @@ export default async function handler(req, res) {
       const verified_guest_count = 0;
       const requires_additional_guest = expected_guest_count > verified_guest_count;
 
+      let kiosk = null;
+      if (flow_type === "visitor") {
+        kiosk = await getActiveKioskConfig();
+      }
+
       const { error } = await supabase.from("demo_sessions").insert({
         session_token: token,
         flow_type,
@@ -300,7 +395,9 @@ export default async function handler(req, res) {
         expected_guest_count,
         verified_guest_count,
         requires_additional_guest,
-        intake_payload: { flow_type }, // NEW (safe)
+        intake_payload: { flow_type },
+        property_external_id: kiosk?.property_external_id ?? null,
+        door_key: kiosk?.door_key ?? null,
         updated_at: new Date().toISOString(),
       });
 
@@ -339,7 +436,7 @@ export default async function handler(req, res) {
             "visitor_last_name",
             "visitor_phone",
             "visitor_reason",
-            "intake_payload", // NEW
+            "intake_payload",
             "document_url",
             "selfie_url",
             "is_verified",
@@ -352,6 +449,11 @@ export default async function handler(req, res) {
             "expected_guest_count",
             "verified_guest_count",
             "requires_additional_guest",
+            "property_external_id",
+            "door_key",
+            "visitor_access_code",
+            "visitor_access_granted_at",
+            "visitor_access_expires_at",
             "created_at",
             "updated_at",
           ].join(",")
@@ -377,7 +479,7 @@ export default async function handler(req, res) {
         success: true,
         session: {
           session_token: session.session_token,
-          flow_type,
+                   flow_type,
           status: session.status ?? null,
           current_step,
 
@@ -393,7 +495,7 @@ export default async function handler(req, res) {
           visitor_phone: session.visitor_phone ?? null,
           visitor_reason: session.visitor_reason ?? null,
 
-          intake_payload: session.intake_payload ?? null, // NEW
+          intake_payload: session.intake_payload ?? null,
 
           adults: session.adults ?? null,
           children: session.children ?? null,
@@ -415,6 +517,13 @@ export default async function handler(req, res) {
           verified_guest_count: verified,
           requires_additional_guest: requires,
           remaining_guest_verifications: Math.max(expected - verified, 0),
+
+          property_external_id: session.property_external_id ?? null,
+          door_key: session.door_key ?? null,
+
+          visitor_access_code: session.visitor_access_code ?? null,
+          visitor_access_granted_at: session.visitor_access_granted_at ?? null,
+          visitor_access_expires_at: session.visitor_access_expires_at ?? null,
         },
       });
     }
@@ -456,13 +565,11 @@ export default async function handler(req, res) {
         session_token,
         flow_type: flowTypeFromBody,
 
-        // guest fields
         guest_name,
         booking_ref,
         room_number,
         expected_guest_count,
 
-        // visitor fields
         visitor_first_name,
         visitor_last_name,
         visitor_phone,
@@ -509,22 +616,15 @@ export default async function handler(req, res) {
           .from("demo_sessions")
           .update({
             flow_type: "visitor",
-
-            // keep legacy columns for now (safe)
             visitor_first_name: vf,
             visitor_last_name: vl,
             visitor_phone: vp,
             visitor_reason: vr,
-
-            // NEW
             intake_payload: nextIntake,
-
             status: "visitor_info_saved",
             current_step: "document",
-
             expected_guest_count: expectedToSet,
             requires_additional_guest: verified < expectedToSet,
-
             updated_at: new Date().toISOString(),
           })
           .eq("session_token", session_token);
@@ -605,7 +705,6 @@ export default async function handler(req, res) {
         adults: clampInt(adultsFromEmail, 0, 10),
         children: clampInt(childrenFromEmail, 0, 10),
 
-        // NEW
         intake_payload: nextIntake,
 
         status: "guest_info_saved",
@@ -705,6 +804,8 @@ export default async function handler(req, res) {
             "intake_payload",
             "expected_guest_count",
             "verified_guest_count",
+            "property_external_id",
+            "door_key",
           ].join(",")
         )
         .eq("session_token", session_token)
@@ -763,11 +864,47 @@ export default async function handler(req, res) {
 
       const documentUrl = `s3://${BUCKET}/${s3Key}`;
 
+      const nextStep = flow_type === "visitor" ? "results" : "selfie";
+      const nextStatus = flow_type === "visitor" ? "access_granted" : "document_uploaded";
+
+      // Visitor: resolve code immediately after doc upload
+      let visitorAccessCode = null;
+      let grantedAt = null;
+      let expiresAt = null;
+
+      if (flow_type === "visitor") {
+        const kiosk = await getActiveKioskConfig();
+
+        const property_external_id = String(sess.property_external_id || kiosk.property_external_id);
+        const door_key = String(sess.door_key || kiosk.door_key);
+        const timezone = String(kiosk.timezone || "Asia/Bangkok");
+
+        const match = await resolveScheduledDoorCode({ property_external_id, door_key, timezone });
+        if (!match?.access_code) {
+          return res.status(500).json({
+            error: "No active door code schedule found for current time. Check door_code_schedule coverage.",
+          });
+        }
+
+        visitorAccessCode = match.access_code;
+        grantedAt = new Date();
+        expiresAt = computeWindowExpiresAt(timezone, match.end_min);
+
+        // Persist the mapping (in case older sessions were missing it)
+        await supabase
+          .from("demo_sessions")
+          .update({
+            property_external_id,
+            door_key,
+          })
+          .eq("session_token", session_token);
+      }
+
       const { error: updateError } = await supabase
         .from("demo_sessions")
         .update({
-          status: "document_uploaded",
-          current_step: "selfie",
+          status: nextStatus,
+          current_step: nextStep,
           document_url: documentUrl,
           extracted_info: {
             text: `Textract pending (async) [guest ${guestIndex}]`,
@@ -776,6 +913,9 @@ export default async function handler(req, res) {
             textract: null,
             guest_index: guestIndex,
           },
+          visitor_access_code: visitorAccessCode,
+          visitor_access_granted_at: grantedAt ? grantedAt.toISOString() : null,
+          visitor_access_expires_at: expiresAt ? expiresAt.toISOString() : null,
           updated_at: new Date().toISOString(),
         })
         .eq("session_token", session_token);
@@ -843,10 +983,16 @@ export default async function handler(req, res) {
         flow_type,
         guest_index: guestIndex,
         extracted_text: `Textract pending (async) [guest ${guestIndex}]`,
+        visitor_access_code: visitorAccessCode,
+        visitor_access_granted_at: grantedAt ? grantedAt.toISOString() : null,
+        visitor_access_expires_at: expiresAt ? expiresAt.toISOString() : null,
         data: {
           extracted_text: `Textract pending (async) [guest ${guestIndex}]`,
           guest_index: guestIndex,
           flow_type,
+          visitor_access_code: visitorAccessCode,
+          visitor_access_granted_at: grantedAt ? grantedAt.toISOString() : null,
+          visitor_access_expires_at: expiresAt ? expiresAt.toISOString() : null,
         },
       });
     }
@@ -976,8 +1122,6 @@ export default async function handler(req, res) {
         return res.status(500).json({ error: "Failed to save verification result" });
       }
 
-      const access_code = flow_type === "visitor" && overallVerified ? "454545" : null;
-
       return res.json({
         success: true,
         flow_type,
@@ -991,8 +1135,6 @@ export default async function handler(req, res) {
         verified_guest_count: verifiedAfter,
         requires_additional_guest: requiresAdditionalGuest,
         remaining_guest_verifications: Math.max(expected - verifiedAfter, 0),
-        access_code,
-        access_duration_minutes: access_code ? 30 : null,
         data: {
           flow_type,
           guest_index: guestIndex,
@@ -1008,8 +1150,6 @@ export default async function handler(req, res) {
           expected_guest_count: expected,
           verified_guest_count: verifiedAfter,
           remaining_guest_verifications: Math.max(expected - verifiedAfter, 0),
-          access_code,
-          access_duration_minutes: access_code ? 30 : null,
         },
       });
     }
