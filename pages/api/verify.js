@@ -13,6 +13,12 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const AWS_REGION = process.env.AWS_REGION;
 const BUCKET = process.env.S3_BUCKET_NAME;
 
+/**
+ * BUILD MARKER (for verifying Vercel is serving the right deployment)
+ * Change this string any time you want to force-confirm which version is live.
+ */
+const BUILD_ID = "visitor-schedule-v1";
+
 if (!SUPABASE_URL) console.warn("Missing env: NEXT_PUBLIC_SUPABASE_URL");
 if (!SUPABASE_SERVICE_KEY) console.warn("Missing env: SUPABASE_SERVICE_KEY");
 if (!AWS_REGION) console.warn("Missing env: AWS_REGION");
@@ -91,11 +97,14 @@ function inferStepFromSession(session) {
       session?.visitor_reason
   );
 
-  const ip = session?.intake_payload && typeof session.intake_payload === "object"
-    ? session.intake_payload
-    : null;
+  const ip =
+    session?.intake_payload && typeof session.intake_payload === "object"
+      ? session.intake_payload
+      : null;
 
-  const hasGuestPayload = Boolean(ip && isNonEmptyString(ip.guest_name) && isNonEmptyString(ip.booking_ref || ip.room_number));
+  const hasGuestPayload = Boolean(
+    ip && isNonEmptyString(ip.guest_name) && isNonEmptyString(ip.booking_ref || ip.room_number)
+  );
   const hasVisitorPayload = Boolean(
     ip &&
       isNonEmptyString(ip.visitor_first_name) &&
@@ -281,7 +290,7 @@ function getBangkokNowParts(timezone = "Asia/Bangkok") {
   const parts = fmt.formatToParts(d);
   const get = (type) => parts.find((p) => p.type === type)?.value;
 
-  const weekday = get("weekday"); // e.g. Mon, Tue
+  const weekday = get("weekday");
   const hour = Number(get("hour"));
   const minute = Number(get("minute"));
 
@@ -294,8 +303,6 @@ function getBangkokNowParts(timezone = "Asia/Bangkok") {
 }
 
 function computeWindowExpiresAt(timezone = "Asia/Bangkok", endMin) {
-  // We cannot reliably create a true timezone-aware Date without a library,
-  // so we store expires_at as "now + delta minutes until end of window" which is sufficient for UI.
   const { minutesSinceMidnight } = getBangkokNowParts(timezone);
   let delta = endMin - minutesSinceMidnight;
   if (delta <= 0) delta += 24 * 60;
@@ -341,9 +348,9 @@ async function resolveScheduledDoorCode({ property_external_id, door_key, timezo
     const start = Number(r.start_min);
     const end = Number(r.end_min);
 
-    if (start === end) return true; // treat as all-day
-    if (end > start) return nowMin >= start && nowMin < end; // normal window
-    return nowMin >= start || nowMin < end; // overnight window
+    if (start === end) return true;
+    if (end > start) return nowMin >= start && nowMin < end;
+    return nowMin >= start || nowMin < end;
   });
 
   return match
@@ -410,6 +417,7 @@ export default async function handler(req, res) {
         session_token: token,
         flow_type,
         verify_url: `/verify/${token}`,
+        build_id: BUILD_ID,
       });
     }
 
@@ -477,9 +485,10 @@ export default async function handler(req, res) {
 
       return res.json({
         success: true,
+        build_id: BUILD_ID,
         session: {
           session_token: session.session_token,
-                   flow_type,
+          flow_type,
           status: session.status ?? null,
           current_step,
 
@@ -557,7 +566,7 @@ export default async function handler(req, res) {
         return res.status(500).json({ error: "Failed to log consent" });
       }
 
-      return res.json({ success: true, message: "Consent logged successfully" });
+      return res.json({ success: true, message: "Consent logged successfully", build_id: BUILD_ID });
     }
 
     if (action === "update_guest") {
@@ -636,6 +645,7 @@ export default async function handler(req, res) {
 
         return res.json({
           success: true,
+          build_id: BUILD_ID,
           flow_type: "visitor",
           expected_guest_count: expectedToSet,
           verified_guest_count: verified,
@@ -726,13 +736,14 @@ export default async function handler(req, res) {
 
       return res.json({
         success: true,
+        build_id: BUILD_ID,
         flow_type: "guest",
         adults: clampInt(adultsFromEmail, 0, 10),
         children: clampInt(childrenFromEmail, 0, 10),
         expected_guest_count: expectedToSet,
         verified_guest_count: verified,
         requires_additional_guest: verified < expectedToSet,
-        remaining_guest_verifications: Math.max(expectedToSet - verified, 0),
+        remaining_guest_verifications: Math.max(expected - verified, 0),
       });
     }
 
@@ -776,6 +787,7 @@ export default async function handler(req, res) {
 
       return res.status(200).json({
         success: true,
+        build_id: BUILD_ID,
         tm30_status,
         missing_fields: missing,
         row: data,
@@ -822,7 +834,9 @@ export default async function handler(req, res) {
 
       const ip = sess.intake_payload && typeof sess.intake_payload === "object" ? sess.intake_payload : null;
 
-      const hasGuestPayload = Boolean(ip && isNonEmptyString(ip.guest_name) && isNonEmptyString(ip.booking_ref || ip.room_number));
+      const hasGuestPayload = Boolean(
+        ip && isNonEmptyString(ip.guest_name) && isNonEmptyString(ip.booking_ref || ip.room_number)
+      );
       const hasVisitorPayload = Boolean(
         ip &&
           isNonEmptyString(ip.visitor_first_name) &&
@@ -867,7 +881,6 @@ export default async function handler(req, res) {
       const nextStep = flow_type === "visitor" ? "results" : "selfie";
       const nextStatus = flow_type === "visitor" ? "access_granted" : "document_uploaded";
 
-      // Visitor: resolve code immediately after doc upload
       let visitorAccessCode = null;
       let grantedAt = null;
       let expiresAt = null;
@@ -883,6 +896,7 @@ export default async function handler(req, res) {
         if (!match?.access_code) {
           return res.status(500).json({
             error: "No active door code schedule found for current time. Check door_code_schedule coverage.",
+            build_id: BUILD_ID,
           });
         }
 
@@ -890,7 +904,6 @@ export default async function handler(req, res) {
         grantedAt = new Date();
         expiresAt = computeWindowExpiresAt(timezone, match.end_min);
 
-        // Persist the mapping (in case older sessions were missing it)
         await supabase
           .from("demo_sessions")
           .update({
@@ -922,7 +935,7 @@ export default async function handler(req, res) {
 
       if (updateError) {
         console.error("Error updating document session:", updateError);
-        return res.status(500).json({ error: "Failed to save document state" });
+        return res.status(500).json({ error: "Failed to save document state", build_id: BUILD_ID });
       }
 
       runTextractAnalyzeIdWithTimeout(imageBuffer, 15000)
@@ -980,6 +993,7 @@ export default async function handler(req, res) {
 
       return res.json({
         success: true,
+        build_id: BUILD_ID,
         flow_type,
         guest_index: guestIndex,
         extracted_text: `Textract pending (async) [guest ${guestIndex}]`,
@@ -1119,11 +1133,12 @@ export default async function handler(req, res) {
 
       if (updateError) {
         console.error("Error updating verification session:", updateError);
-        return res.status(500).json({ error: "Failed to save verification result" });
+        return res.status(500).json({ error: "Failed to save verification result", build_id: BUILD_ID });
       }
 
       return res.json({
         success: true,
+        build_id: BUILD_ID,
         flow_type,
         guest_index: guestIndex,
         guest_verified,
@@ -1154,9 +1169,9 @@ export default async function handler(req, res) {
       });
     }
 
-    return res.status(400).json({ error: "Invalid action" });
+    return res.status(400).json({ error: "Invalid action", build_id: BUILD_ID });
   } catch (error) {
     console.error("Error:", error);
-    return res.status(500).json({ error: error?.message || "Unknown server error" });
+    return res.status(500).json({ error: error?.message || "Unknown server error", build_id: BUILD_ID });
   }
 }
