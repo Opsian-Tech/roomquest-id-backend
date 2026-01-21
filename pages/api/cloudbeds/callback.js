@@ -1,4 +1,4 @@
-@@ -1,4 +1,5 @@
+
 // pages/api/cloudbeds/callback.js
 
 import { createClient } from "@supabase/supabase-js";
