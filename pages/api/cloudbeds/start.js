@@ -1,39 +1,39 @@
-// pages/api/cloudbeds/start.js
+import crypto from "crypto";
 
-const CLOUDBEDS_CLIENT_ID = process.env.CLOUDBEDS_CLIENT_ID;
-
-// MUST match what you whitelisted in Cloudbeds
-const CLOUDBEDS_REDIRECT_URI =
-  process.env.CLOUDBEDS_REDIRECT_URI ||
-  "https://roomquest-id-visitor-flow.vercel.app/api/cloudbeds/callback";
-
-// If Cloudbeds gave you scopes, put them here (space-separated).
-// If you don't know yet, leave it as "" and your Cloudbeds guy will tell you.
-const CLOUDBEDS_SCOPES = process.env.CLOUDBEDS_SCOPES || "";
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, X-Requested-With, Accept, Origin, Authorization"
+  );
+}
 
 export default async function handler(req, res) {
-  try {
-    if (!CLOUDBEDS_CLIENT_ID) {
-      return res.status(500).send("Missing CLOUDBEDS_CLIENT_ID env var");
-    }
+  setCors(res);
 
-    // Basic CSRF protection: store a random state
-    const state = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method !== "GET") return res.status(405).send("Method not allowed");
 
-    const authorizeUrl = new URL("https://hotels.cloudbeds.com/oauth/authorize");
-    authorizeUrl.searchParams.set("response_type", "code");
-    authorizeUrl.searchParams.set("client_id", CLOUDBEDS_CLIENT_ID);
-    authorizeUrl.searchParams.set("redirect_uri", CLOUDBEDS_REDIRECT_URI);
-    authorizeUrl.searchParams.set("state", state);
+  const client_id = process.env.CLOUDBEDS_CLIENT_ID;
+  const redirect_uri =
+    process.env.CLOUDBEDS_REDIRECT_URI ||
+    "https://roomquest-id-visitor-flow.vercel.app/api/cloudbeds/callback";
 
-    if (CLOUDBEDS_SCOPES.trim()) {
-      authorizeUrl.searchParams.set("scope", CLOUDBEDS_SCOPES.trim());
-    }
+  if (!client_id) return res.status(500).send("Missing env: CLOUDBEDS_CLIENT_ID");
 
-    // Redirect you to Cloudbeds login/authorize screen
-    res.status(302).setHeader("Location", authorizeUrl.toString());
-    return res.end();
-  } catch (e) {
-    return res.status(500).send(`Server error: ${e?.message || String(e)}`);
-  }
+  const state = crypto.randomBytes(16).toString("hex");
+  const scope = "reservations.read";
+
+  // ✅ Correct Cloudbeds OAuth authorize endpoint:
+  const authUrl =
+    `https://api.cloudbeds.com/api/v1.3/oauth` +
+    `?client_id=${encodeURIComponent(client_id)}` +
+    `&redirect_uri=${encodeURIComponent(redirect_uri)}` +
+    `&state=${encodeURIComponent(state)}` +
+    `&scope=${encodeURIComponent(scope)}`;
+
+  res.writeHead(302, { Location: authUrl });
+  res.end();
 }
