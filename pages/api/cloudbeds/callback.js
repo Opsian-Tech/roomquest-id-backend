@@ -13,7 +13,6 @@ function setCors(res) {
 
 export default async function handler(req, res) {
   setCors(res);
-
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "GET") return res.status(405).send("Method not allowed");
 
@@ -23,38 +22,32 @@ export default async function handler(req, res) {
 
     const client_id = process.env.CLOUDBEDS_CLIENT_ID;
     const client_secret = process.env.CLOUDBEDS_CLIENT_SECRET;
-    const redirect_uri =
-      process.env.CLOUDBEDS_REDIRECT_URI ||
-      "https://roomquest-id-visitor-flow.vercel.app/api/cloudbeds/callback";
+    const redirect_uri = process.env.CLOUDBEDS_REDIRECT_URI;
 
     if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
       return res.status(500).send("Missing Supabase env vars");
     }
-    if (!client_id || !client_secret) {
-      return res.status(500).send("Missing CLOUDBEDS_CLIENT_ID or CLOUDBEDS_CLIENT_SECRET");
-    }
-
-    // Cloudbeds docs often use authorization_code; some flows send code
-    const code =
-      req.query.authorization_code ||
-      req.query.code ||
-      req.query.authorizationCode ||
-      null;
-
-    if (!code) {
+    if (!client_id || !client_secret || !redirect_uri) {
       return res
-        .status(400)
-        .send("Missing authorization code (expected ?authorization_code=... or ?code=...)");
+        .status(500)
+        .send("Missing env: CLOUDBEDS_CLIENT_ID / CLOUDBEDS_CLIENT_SECRET / CLOUDBEDS_REDIRECT_URI");
     }
 
-    // Exchange authorization_code for access_token
+    // Cloudbeds may send back ?code=... OR ?authorization_code=...
+    const code = req.query.code || req.query.authorization_code;
+    if (!code) {
+      return res.status(400).send("Missing authorization code on callback (?code=...)");
+    }
+
+    // ✅ Exchange code -> token (v1.3)
+    // grant_type = authorization_code
     const tokenUrl = "https://api.cloudbeds.com/api/v1.3/access_token";
 
     const body = new URLSearchParams({
       grant_type: "authorization_code",
-      client_id: String(client_id),
-      client_secret: String(client_secret),
-      redirect_uri: String(redirect_uri),
+      client_id,
+      client_secret,
+      redirect_uri,
       authorization_code: String(code),
     });
 
@@ -72,18 +65,17 @@ export default async function handler(req, res) {
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-    // Save token (single row)
     const { error: upsertErr } = await supabase
       .from("cloudbeds_tokens")
       .upsert(
         {
           id: 1,
-          access_token: tokenJson?.access_token ?? null,
-          refresh_token: tokenJson?.refresh_token ?? null,
-          token_type: tokenJson?.token_type ?? null,
-          expires_in: tokenJson?.expires_in ?? null,
-          scope: tokenJson?.scope ?? null,
-          raw: tokenJson ?? null,
+          access_token: tokenJson.access_token,
+          refresh_token: tokenJson.refresh_token,
+          token_type: tokenJson.token_type,
+          expires_in: tokenJson.expires_in,
+          scope: tokenJson.scope || null,
+          raw: tokenJson,
           updated_at: new Date().toISOString(),
         },
         { onConflict: "id" }
