@@ -1,34 +1,40 @@
 // pages/api/cloudbeds/start.js
+import crypto from "crypto";
 
-export default function handler(req, res) {
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, X-Requested-With, Accept, Origin, Authorization"
+  );
+}
+
+export default function handler(req, res) {
+  setCors(res);
 
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "GET") return res.status(405).send("Method not allowed");
 
   const client_id = process.env.CLOUDBEDS_CLIENT_ID;
-  const redirect_uri = process.env.CLOUDBEDS_REDIRECT_URI; // must match Cloudbeds whitelist exactly
-  const scope = process.env.CLOUDBEDS_SCOPE || "reservations.read";
+  const redirect_uri =
+    process.env.CLOUDBEDS_REDIRECT_URI ||
+    "https://roomquest-id-visitor-flow.vercel.app/api/cloudbeds/callback";
 
-  // IMPORTANT: this is the AUTHORIZE endpoint (browser login)
-  const authorizeBase =
-    process.env.CLOUDBEDS_AUTHORIZE_URL || "https://hotels.cloudbeds.com/oauth/authorize";
+  if (!client_id) return res.status(500).send("Missing env: CLOUDBEDS_CLIENT_ID");
+  if (!redirect_uri) return res.status(500).send("Missing env: CLOUDBEDS_REDIRECT_URI");
 
-  if (!client_id || !redirect_uri) {
-    return res.status(500).send("Missing CLOUDBEDS_CLIENT_ID or CLOUDBEDS_REDIRECT_URI");
-  }
+  const state = crypto.randomBytes(16).toString("hex");
 
-  const state = Math.random().toString(36).slice(2) + Date.now().toString(36);
-
+  // Cloudbeds OAuth start endpoint (per docs)
+  // NOTE: scopes are typically configured in the Cloudbeds App settings;
+  // if your account supports scope in URL, you can append &scope=...
   const url =
-    `${authorizeBase}` +
-    `?response_type=code` +
-    `&client_id=${encodeURIComponent(client_id)}` +
+    "https://api.cloudbeds.com/api/v1.3/oauth" +
+    `?client_id=${encodeURIComponent(client_id)}` +
     `&redirect_uri=${encodeURIComponent(redirect_uri)}` +
-    `&state=${encodeURIComponent(state)}` +
-    `&scope=${encodeURIComponent(scope)}`;
+    `&state=${encodeURIComponent(state)}`;
 
-  return res.status(302).setHeader("Location", url).end();
+  res.status(302).setHeader("Location", url).end();
 }
