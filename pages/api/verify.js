@@ -1,3 +1,6 @@
+
+
+// pages/api/verify.js
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
@@ -17,7 +20,7 @@ const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL;
 /**
  * BUILD MARKER
  */
-const BUILD_ID = "visitor-schedule-v1";
+const BUILD_ID = "cloudbeds-integration-v1";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const s3 = new S3Client({ region: AWS_REGION });
@@ -25,15 +28,28 @@ const rekognition = new RekognitionClient({ region: AWS_REGION });
 const textract = new TextractClient({ region: AWS_REGION });
 
 async function fetchCloudbedsReservation(reservationId) {
+  console.log("[Cloudbeds] Fetching reservation:", reservationId);
+
   const res = await fetch(`${BACKEND_URL}/api/cloudbeds/reservation`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ reservation_id: reservationId }),
   });
 
-  if (!res.ok) throw new Error("Cloudbeds request failed");
+  if (!res.ok) {
+    const errorText = await res.text();
+    console.error("[Cloudbeds] Request failed:", res.status, errorText);
+    throw new Error("Cloudbeds request failed");
+  }
+
   const data = await res.json();
-  if (!data?.success) throw new Error("Invalid Cloudbeds response");
+
+  if (!data?.success) {
+    console.error("[Cloudbeds] Invalid response:", data);
+    throw new Error("Invalid Cloudbeds response");
+  }
+
+  console.log("[Cloudbeds] Success:", { roomName: data.roomName, accessCode: data.accessCode });
   return data;
 }
 
@@ -147,6 +163,7 @@ export default async function handler(req, res) {
       const requiresAdditionalGuest = verifiedAfter < expected;
       const overallVerified = verifiedAfter >= expected;
 
+      // Cloudbeds integration - fetch room and access code
       let physical_room = null;
       let room_access_code = null;
       let cloudbeds_reservation_id = null;
@@ -157,15 +174,13 @@ export default async function handler(req, res) {
           physical_room = cloudbeds.roomName || null;
           room_access_code = cloudbeds.accessCode || null;
           cloudbeds_reservation_id = session.room_number;
-
-          await supabase.from("demo_sessions").update({
-            physical_room,
-            room_access_code,
-            cloudbeds_reservation_id,
-          }).eq("session_token", session_token);
-        } catch {}
+        } catch (cbErr) {
+          console.error("[Cloudbeds] Lookup failed:", cbErr.message);
+          // Continue without Cloudbeds data - guest is still verified
+        }
       }
 
+      // Single combined database update
       await supabase.from("demo_sessions").update({
         selfie_url: selfieUrl,
         is_verified: overallVerified,
@@ -174,6 +189,9 @@ export default async function handler(req, res) {
         face_match_score: similarity,
         verified_guest_count: verifiedAfter,
         requires_additional_guest: requiresAdditionalGuest,
+        physical_room,
+        room_access_code,
+        cloudbeds_reservation_id,
         updated_at: new Date().toISOString(),
       }).eq("session_token", session_token);
 
@@ -191,6 +209,7 @@ export default async function handler(req, res) {
 
     return res.status(400).json({ error: "Invalid action" });
   } catch (e) {
+    console.error("[verify.js] Error:", e);
     return res.status(500).json({ error: e.message || "Server error" });
   }
 }
