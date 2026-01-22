@@ -115,6 +115,103 @@ export default async function handler(req, res) {
       return safeJson(res, 500, { error: "Server misconfigured: missing AWS env vars" });
     }
 
+    // ✅ Added: get_session so the frontend can read physical_room + room_access_code
+    if (action === "get_session") {
+      const { session_token } = req.body || {};
+      if (!session_token) return safeJson(res, 400, { error: "Session token required" });
+
+      const { data: session, error: sessionErr } = await supabase
+        .from("demo_sessions")
+        .select(
+          [
+            "session_token",
+            "flow_type",
+            "status",
+            "current_step",
+            "consent_given",
+            "consent_time",
+            "consent_locale",
+            "guest_name",
+            "room_number",
+            "adults",
+            "children",
+            "visitor_first_name",
+            "visitor_last_name",
+            "visitor_phone",
+            "visitor_reason",
+            "intake_payload",
+            "document_url",
+            "selfie_url",
+            "is_verified",
+            "verification_score",
+            "liveness_score",
+            "face_match_score",
+            "expected_guest_count",
+            "verified_guest_count",
+            "requires_additional_guest",
+            "physical_room",
+            "room_access_code",
+            "cloudbeds_reservation_id",
+            "created_at",
+            "updated_at",
+          ].join(",")
+        )
+        .eq("session_token", session_token)
+        .single();
+
+      if (sessionErr) {
+        console.error("[verify.js] get_session lookup error:", sessionErr);
+        return safeJson(res, 500, { error: "Failed to load session" });
+      }
+      if (!session) return safeJson(res, 404, { error: "Session not found" });
+
+      return safeJson(res, 200, {
+        success: true,
+        session: {
+          session_token: session.session_token,
+          flow_type: session.flow_type ?? null,
+          status: session.status ?? null,
+          current_step: session.current_step ?? null,
+
+          consent_given: session.consent_given ?? null,
+          consent_time: session.consent_time ?? null,
+          consent_locale: session.consent_locale ?? null,
+
+          guest_name: session.guest_name ?? null,
+          room_number: session.room_number ?? null,
+          adults: session.adults ?? null,
+          children: session.children ?? null,
+
+          visitor_first_name: session.visitor_first_name ?? null,
+          visitor_last_name: session.visitor_last_name ?? null,
+          visitor_phone: session.visitor_phone ?? null,
+          visitor_reason: session.visitor_reason ?? null,
+
+          intake_payload: session.intake_payload ?? null,
+
+          document_uploaded: Boolean(session.document_url),
+          selfie_uploaded: Boolean(session.selfie_url),
+
+          is_verified: session.is_verified ?? null,
+          verification_score: session.verification_score ?? null,
+          liveness_score: session.liveness_score ?? null,
+          face_match_score: session.face_match_score ?? null,
+
+          expected_guest_count: session.expected_guest_count ?? null,
+          verified_guest_count: session.verified_guest_count ?? null,
+          requires_additional_guest: session.requires_additional_guest ?? null,
+
+          // ✅ These are what your ResultsStep wants
+          physical_room: session.physical_room ?? null,
+          room_access_code: session.room_access_code ?? null,
+          cloudbeds_reservation_id: session.cloudbeds_reservation_id ?? null,
+
+          created_at: session.created_at ?? null,
+          updated_at: session.updated_at ?? null,
+        },
+      });
+    }
+
     if (action === "verify_face") {
       const { session_token, selfie_data } = req.body || {};
       if (!session_token || !selfie_data) {
@@ -138,7 +235,6 @@ export default async function handler(req, res) {
       const verifiedBefore = clampInt(session.verified_guest_count, 0, 10);
       const guestIndex = clampInt(verifiedBefore + 1, 1, expected);
 
-      // Read the uploaded document image from S3
       const docKey = `demo/${session_token}/document_${guestIndex}.jpg`;
 
       let docBuffer;
@@ -152,14 +248,12 @@ export default async function handler(req, res) {
         });
       }
 
-      // Decode selfie
       const selfieBase64 = normalizeBase64(selfie_data);
       if (!selfieBase64) return safeJson(res, 400, { error: "Invalid selfie_data format" });
 
       const selfieBuffer = Buffer.from(selfieBase64, "base64");
       if (selfieBuffer.length < 1000) return safeJson(res, 400, { error: "Image too small" });
 
-      // Upload selfie to S3
       const selfieKey = `demo/${session_token}/selfie_${guestIndex}.jpg`;
       await s3.send(
         new PutObjectCommand({
@@ -172,7 +266,6 @@ export default async function handler(req, res) {
 
       const selfieUrl = `s3://${BUCKET}/${selfieKey}`;
 
-      // Liveness-ish signal (basic)
       const liveness = await rekognition.send(
         new DetectFacesCommand({ Image: { Bytes: selfieBuffer }, Attributes: ["ALL"] })
       );
@@ -181,7 +274,6 @@ export default async function handler(req, res) {
       const isLive = Boolean(face?.EyesOpen?.Value);
       const livenessScore = (face?.Confidence || 0) / 100;
 
-      // Face match
       const compare = await rekognition.send(
         new CompareFacesCommand({
           SourceImage: { Bytes: selfieBuffer },
@@ -191,7 +283,6 @@ export default async function handler(req, res) {
       );
 
       const similarity = (compare.FaceMatches?.[0]?.Similarity || 0) / 100;
-
       const verificationScore = (isLive ? 0.4 : 0) + livenessScore * 0.3 + similarity * 0.3;
 
       const guest_verified = isLive && similarity >= 0.65;
@@ -203,7 +294,6 @@ export default async function handler(req, res) {
       const requiresAdditionalGuest = verifiedAfter < expected;
       const overallVerified = verifiedAfter >= expected;
 
-      // Cloudbeds integration - fetch room and access code
       let physical_room = null;
       let room_access_code = null;
       let cloudbeds_reservation_id = null;
@@ -216,11 +306,9 @@ export default async function handler(req, res) {
           cloudbeds_reservation_id = session.room_number;
         } catch (cbErr) {
           console.error("[Cloudbeds] Lookup failed:", cbErr?.message || cbErr);
-          // Continue without Cloudbeds data - guest is still verified
         }
       }
 
-      // Single combined database update
       const { error: updateErr } = await supabase
         .from("demo_sessions")
         .update({
