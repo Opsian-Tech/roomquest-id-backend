@@ -12,22 +12,30 @@ const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const AWS_REGION = process.env.AWS_REGION;
 const BUCKET = process.env.S3_BUCKET_NAME;
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL;
 
 /**
- * BUILD MARKER (for verifying Vercel is serving the right deployment)
- * Change this string any time you want to force-confirm which version is live.
+ * BUILD MARKER
  */
 const BUILD_ID = "visitor-schedule-v1";
-
-if (!SUPABASE_URL) console.warn("Missing env: NEXT_PUBLIC_SUPABASE_URL");
-if (!SUPABASE_SERVICE_KEY) console.warn("Missing env: SUPABASE_SERVICE_KEY");
-if (!AWS_REGION) console.warn("Missing env: AWS_REGION");
-if (!BUCKET) console.warn("Missing env: S3_BUCKET_NAME");
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const s3 = new S3Client({ region: AWS_REGION });
 const rekognition = new RekognitionClient({ region: AWS_REGION });
 const textract = new TextractClient({ region: AWS_REGION });
+
+async function fetchCloudbedsReservation(reservationId) {
+  const res = await fetch(`${BACKEND_URL}/api/cloudbeds/reservation`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reservation_id: reservationId }),
+  });
+
+  if (!res.ok) throw new Error("Cloudbeds request failed");
+  const data = await res.json();
+  if (!data?.success) throw new Error("Invalid Cloudbeds response");
+  return data;
+}
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Credentials", "true");
@@ -51,1013 +59,54 @@ async function streamToBuffer(readable) {
   return Buffer.concat(chunks);
 }
 
-function normalizeBase64(base64OrDataUrl) {
-  if (typeof base64OrDataUrl !== "string") return null;
-  if (base64OrDataUrl.startsWith("data:image/")) {
-    return base64OrDataUrl.replace(/^data:image\/\w+;base64,/, "");
-  }
-  return base64OrDataUrl;
-}
-
-function normalizeGuestName(name) {
-  return String(name || "")
-    .toLowerCase()
-    .trim()
-    .replace(/\s+/g, " ")
-    .replace(/[^\p{L}\p{N}\s]/gu, "");
-}
-
-function normalizeReservationNumber(v) {
-  return String(v || "").toUpperCase().trim().replace(/[\s-]/g, "");
+function normalizeBase64(v) {
+  if (typeof v !== "string") return null;
+  if (v.startsWith("data:image/")) return v.replace(/^data:image\/\w+;base64,/, "");
+  return v;
 }
 
 function normalizeFlowType(v) {
-  const s = String(v || "").trim().toLowerCase();
-  return s === "visitor" ? "visitor" : "guest";
-}
-
-function isNonEmptyString(v) {
-  return typeof v === "string" && v.trim().length > 0;
-}
-
-function inferStepFromSession(session) {
-  if (!session) return "welcome";
-  if (session?.current_step) return session.current_step;
-
-  if (session?.is_verified === true || session?.verification_score != null) return "results";
-  if (session?.selfie_url) return "results";
-  if (session?.document_url) return "selfie";
-
-  const hasGuestCols = Boolean(session?.guest_name && session?.room_number);
-
-  const hasVisitorCols = Boolean(
-    session?.visitor_first_name &&
-      session?.visitor_last_name &&
-      session?.visitor_phone &&
-      session?.visitor_reason
-  );
-
-  const ip =
-    session?.intake_payload && typeof session.intake_payload === "object"
-      ? session.intake_payload
-      : null;
-
-  const hasGuestPayload = Boolean(
-    ip && isNonEmptyString(ip.guest_name) && isNonEmptyString(ip.booking_ref || ip.room_number)
-  );
-  const hasVisitorPayload = Boolean(
-    ip &&
-      isNonEmptyString(ip.visitor_first_name) &&
-      isNonEmptyString(ip.visitor_last_name) &&
-      isNonEmptyString(ip.phone) &&
-      isNonEmptyString(ip.reason)
-  );
-
-  if (hasGuestCols || hasVisitorCols || hasGuestPayload || hasVisitorPayload) return "document";
-  return "welcome";
-}
-
-function normalizeKey(k = "") {
-  return String(k).trim().toLowerCase().replace(/\s+/g, "_");
-}
-
-function parseMrzTD3(mrz) {
-  try {
-    const clean = String(mrz || "")
-      .replace(/\r/g, "\n")
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .join("")
-      .replace(/\s+/g, "")
-      .toUpperCase();
-
-    const lines =
-      clean.includes("\n")
-        ? clean.split("\n").filter(Boolean)
-        : clean.length >= 88
-        ? [clean.slice(0, 44), clean.slice(44, 88)]
-        : clean.length >= 44
-        ? [clean.slice(0, 44), clean.slice(44, 88)]
-        : [];
-
-    if (lines.length < 2) return null;
-
-    const l2 = String(lines[1] || "").padEnd(44, "<");
-
-    const passportNumberRaw = l2.slice(0, 9);
-    const passport_number = passportNumberRaw.replace(/</g, "").trim() || null;
-
-    const nationality = l2.slice(10, 13).replace(/</g, "").trim() || null;
-
-    const dob_yymmdd_raw = l2.slice(13, 19);
-    const dob_yymmdd = dob_yymmdd_raw.replace(/</g, "").trim() || null;
-
-    const sexRaw = l2.slice(20, 21);
-    const sex = sexRaw.replace(/</g, "").trim() || null;
-
-    const exp_yymmdd_raw = l2.slice(21, 27);
-    const exp_yymmdd = exp_yymmdd_raw.replace(/</g, "").trim() || null;
-
-    return {
-      passport_number,
-      nationality,
-      sex,
-      dob_yymmdd,
-      exp_yymmdd,
-      line1: lines[0] || null,
-      line2: lines[1] || null,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function parseAnalyzeIdFields(fields = []) {
-  const raw = {};
-  for (const f of fields) {
-    const key = normalizeKey(f?.Type?.Text);
-    const val = f?.ValueDetection?.Text;
-    if (key && val) raw[key] = val;
-  }
-
-  const first_name = raw.first_name || raw.firstname || raw.given_name || raw.givenname || null;
-  const middle_name = raw.middle_name || raw.middlename || raw.second_name || raw.secondname || null;
-  const last_name =
-    raw.last_name || raw.lastname || raw.surname || raw.family_name || raw.familyname || null;
-
-  const full_name =
-    raw.full_name ||
-    raw.name ||
-    ([first_name, middle_name, last_name].filter(Boolean).join(" ") || null);
-
-  const dob = raw.date_of_birth || raw.dob || null;
-  const date_of_issue = raw.date_of_issue || raw.issue_date || null;
-  const expiration_date = raw.expiration_date || raw.expiry_date || raw.expiry || null;
-
-  const document_number =
-    raw.document_number ||
-    raw.passport_number ||
-    raw.id_number ||
-    raw.identity_document_number ||
-    raw.personal_number ||
-    null;
-
-  const id_type = raw.id_type || null;
-  const mrz_code = raw.mrz_code || raw.mrz || null;
-
-  const sex = raw.sex || raw.gender || null;
-  let nationality = raw.nationality || raw.country || null;
-
-  const mrz_parsed = mrz_code ? parseMrzTD3(mrz_code) : null;
-
-  if (!nationality && mrz_parsed?.nationality) nationality = mrz_parsed.nationality;
-  const sexFinal = sex || mrz_parsed?.sex || null;
-
-  const documentNumberFinal = document_number || mrz_parsed?.passport_number || null;
-  const dobFinal = dob || mrz_parsed?.dob_yymmdd || null;
-  const expirationFinal = expiration_date || mrz_parsed?.exp_yymmdd || null;
-
-  return {
-    text: null,
-    id_type,
-    document_number: documentNumberFinal,
-    last_name,
-    first_name,
-    middle_name,
-    date_of_birth: dobFinal,
-    date_of_issue,
-    expiration_date: expirationFinal,
-    nationality,
-    sex: sexFinal,
-    mrz_code,
-    mrz_parsed,
-    full_name,
-    raw,
-  };
-}
-
-async function runTextractAnalyzeIdWithTimeout(imageBuffer, timeoutMs = 15000) {
-  const run = async () => {
-    const res = await textract.send(
-      new AnalyzeIDCommand({
-        DocumentPages: [{ Bytes: imageBuffer }],
-      })
-    );
-    const fields = res?.IdentityDocuments?.[0]?.IdentityDocumentFields || [];
-    return parseAnalyzeIdFields(fields);
-  };
-
-  try {
-    const data = await Promise.race([
-      run(),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`Textract timeout after ${timeoutMs}ms`)), timeoutMs)
-      ),
-    ]);
-    return { ok: true, data };
-  } catch (e) {
-    return { ok: false, error: e?.message || String(e) };
-  }
-}
-
-function toIntOrNull(v) {
-  if (v === null || v === undefined) return null;
-  const n = Number(v);
-  if (!Number.isFinite(n)) return null;
-  return Math.trunc(n);
+  return String(v || "").toLowerCase() === "visitor" ? "visitor" : "guest";
 }
 
 function clampInt(n, min, max) {
-  const x = toIntOrNull(n);
-  if (x === null) return min;
-  return Math.min(Math.max(x, min), max);
-}
-
-function getBangkokNowParts(timezone = "Asia/Bangkok") {
-  const d = new Date();
-  const fmt = new Intl.DateTimeFormat("en-US", {
-    timeZone: timezone,
-    hour12: false,
-    weekday: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-
-  const parts = fmt.formatToParts(d);
-  const get = (type) => parts.find((p) => p.type === type)?.value;
-
-  const weekday = get("weekday");
-  const hour = Number(get("hour"));
-  const minute = Number(get("minute"));
-
-  const dowMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
-  const dow = dowMap[weekday] ?? 0;
-
-  const minutesSinceMidnight = hour * 60 + minute;
-
-  return { now: d, dow, minutesSinceMidnight };
-}
-
-function computeWindowExpiresAt(timezone = "Asia/Bangkok", endMin) {
-  const { minutesSinceMidnight } = getBangkokNowParts(timezone);
-  let delta = endMin - minutesSinceMidnight;
-  if (delta <= 0) delta += 24 * 60;
-  return new Date(Date.now() + delta * 60 * 1000);
-}
-
-async function getActiveKioskConfig() {
-  const { data, error } = await supabase
-    .from("kiosk_config")
-    .select("property_external_id, door_key, timezone, is_active, kiosk_key")
-    .eq("kiosk_key", "visitor_kiosk")
-    .eq("is_active", true)
-    .limit(1)
-    .maybeSingle();
-
-  if (error) throw new Error(`kiosk_config lookup failed: ${error.message}`);
-  if (!data) throw new Error("kiosk_config missing: create visitor_kiosk row in Supabase");
-  return {
-    property_external_id: String(data.property_external_id),
-    door_key: String(data.door_key || "main_door"),
-    timezone: String(data.timezone || "Asia/Bangkok"),
-  };
-}
-
-async function resolveScheduledDoorCode({ property_external_id, door_key, timezone }) {
-  const { dow, minutesSinceMidnight } = getBangkokNowParts(timezone || "Asia/Bangkok");
-
-  const { data, error } = await supabase
-    .from("door_code_schedule")
-    .select("access_code, start_min, end_min, dow, start_time, end_time")
-    .eq("property_external_id", property_external_id)
-    .eq("door_key", door_key)
-    .eq("dow", dow)
-    .eq("is_active", true)
-    .order("start_min", { ascending: true });
-
-  if (error) throw new Error(`door_code_schedule query failed: ${error.message}`);
-  if (!data || data.length === 0) return null;
-
-  const nowMin = minutesSinceMidnight;
-
-  const match = data.find((r) => {
-    const start = Number(r.start_min);
-    const end = Number(r.end_min);
-
-    if (start === end) return true;
-    if (end > start) return nowMin >= start && nowMin < end;
-    return nowMin >= start || nowMin < end;
-  });
-
-  return match
-    ? {
-        access_code: String(match.access_code),
-        start_min: Number(match.start_min),
-        end_min: Number(match.end_min),
-      }
-    : null;
+  const x = Number(n);
+  if (!Number.isFinite(x)) return min;
+  return Math.min(Math.max(Math.trunc(x), min), max);
 }
 
 export default async function handler(req, res) {
   setCors(res);
 
-  if (req.method === "OPTIONS") {
-    res.status(200).end();
-    return;
-  }
-
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   const { action } = req.body || {};
 
   try {
-    if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-      return res.status(500).json({ error: "Server misconfigured: missing Supabase env vars" });
-    }
-
-    if (action === "start") {
-      const token = generateToken();
-      const flow_type = normalizeFlowType(req.body?.flow_type);
-
-      const expected_guest_count = 1;
-      const verified_guest_count = 0;
-      const requires_additional_guest = expected_guest_count > verified_guest_count;
-
-      let kiosk = null;
-      if (flow_type === "visitor") {
-        kiosk = await getActiveKioskConfig();
-      }
-
-      const { error } = await supabase.from("demo_sessions").insert({
-        session_token: token,
-        flow_type,
-        status: "started",
-        current_step: "welcome",
-        expected_guest_count,
-        verified_guest_count,
-        requires_additional_guest,
-        intake_payload: { flow_type },
-        property_external_id: kiosk?.property_external_id ?? null,
-        door_key: kiosk?.door_key ?? null,
-        updated_at: new Date().toISOString(),
-      });
-
-      if (error) {
-        console.error("Error creating session:", error);
-        return res.status(500).json({ error: "Failed to create session" });
-      }
-
-      return res.json({
-        session_token: token,
-        flow_type,
-        verify_url: `/verify/${token}`,
-        build_id: BUILD_ID,
-      });
-    }
-
-    if (action === "get_session") {
-      const { session_token } = req.body || {};
-      if (!session_token) return res.status(400).json({ error: "Session token required" });
-
-      const { data: session, error } = await supabase
-        .from("demo_sessions")
-        .select(
-          [
-            "session_token",
-            "flow_type",
-            "status",
-            "current_step",
-            "consent_given",
-            "consent_time",
-            "consent_locale",
-            "guest_name",
-            "room_number",
-            "adults",
-            "children",
-            "visitor_first_name",
-            "visitor_last_name",
-            "visitor_phone",
-            "visitor_reason",
-            "intake_payload",
-            "document_url",
-            "selfie_url",
-            "is_verified",
-            "verification_score",
-            "liveness_score",
-            "face_match_score",
-            "extracted_info",
-            "tm30_info",
-            "tm30_status",
-            "expected_guest_count",
-            "verified_guest_count",
-            "requires_additional_guest",
-            "property_external_id",
-            "door_key",
-            "visitor_access_code",
-            "visitor_access_granted_at",
-            "visitor_access_expires_at",
-            "created_at",
-            "updated_at",
-          ].join(",")
-        )
-        .eq("session_token", session_token)
-        .single();
-
-      if (error || !session) return res.status(404).json({ error: "Session not found" });
-
-      const flow_type = normalizeFlowType(session.flow_type);
-      const current_step = inferStepFromSession(session);
-      const expected = clampInt(session.expected_guest_count, 1, 10);
-      const verified = clampInt(session.verified_guest_count, 0, 10);
-
-      const requires =
-        session.requires_additional_guest === true
-          ? true
-          : session.requires_additional_guest === false
-          ? false
-          : verified < expected;
-
-      return res.json({
-        success: true,
-        build_id: BUILD_ID,
-        session: {
-          session_token: session.session_token,
-          flow_type,
-          status: session.status ?? null,
-          current_step,
-
-          consent_given: session.consent_given ?? null,
-          consent_time: session.consent_time ?? null,
-          consent_locale: session.consent_locale ?? null,
-
-          guest_name: session.guest_name ?? null,
-          room_number: session.room_number ?? null,
-
-          visitor_first_name: session.visitor_first_name ?? null,
-          visitor_last_name: session.visitor_last_name ?? null,
-          visitor_phone: session.visitor_phone ?? null,
-          visitor_reason: session.visitor_reason ?? null,
-
-          intake_payload: session.intake_payload ?? null,
-
-          adults: session.adults ?? null,
-          children: session.children ?? null,
-
-          document_uploaded: Boolean(session.document_url),
-          selfie_uploaded: Boolean(session.selfie_url),
-
-          is_verified: session.is_verified ?? null,
-          verification_score: session.verification_score ?? null,
-          liveness_score: session.liveness_score ?? null,
-          face_match_score: session.face_match_score ?? null,
-
-          extracted_info: session.extracted_info ?? null,
-
-          tm30_info: session.tm30_info ?? {},
-          tm30_status: session.tm30_status ?? "draft",
-
-          expected_guest_count: expected,
-          verified_guest_count: verified,
-          requires_additional_guest: requires,
-          remaining_guest_verifications: Math.max(expected - verified, 0),
-
-          property_external_id: session.property_external_id ?? null,
-          door_key: session.door_key ?? null,
-
-          visitor_access_code: session.visitor_access_code ?? null,
-          visitor_access_granted_at: session.visitor_access_granted_at ?? null,
-          visitor_access_expires_at: session.visitor_access_expires_at ?? null,
-        },
-      });
-    }
-
-    if (action === "log_consent") {
-      const { session_token, consent_given, consent_time, consent_locale } = req.body || {};
-      if (!session_token) return res.status(400).json({ error: "Session token required" });
-
-      const { data: existing, error: findError } = await supabase
-        .from("demo_sessions")
-        .select("session_token")
-        .eq("session_token", session_token)
-        .single();
-
-      if (findError || !existing) return res.status(404).json({ error: "Session not found" });
-
-      const { error: updateError } = await supabase
-        .from("demo_sessions")
-        .update({
-          consent_given: Boolean(consent_given),
-          consent_time: consent_time || new Date().toISOString(),
-          consent_locale: consent_locale || "en",
-          status: "consent_logged",
-          current_step: "welcome",
-          updated_at: new Date().toISOString(),
-        })
-        .eq("session_token", session_token);
-
-      if (updateError) {
-        console.error("Error updating consent:", updateError);
-        return res.status(500).json({ error: "Failed to log consent" });
-      }
-
-      return res.json({ success: true, message: "Consent logged successfully", build_id: BUILD_ID });
-    }
-
-    if (action === "update_guest") {
-      const {
-        session_token,
-        flow_type: flowTypeFromBody,
-
-        guest_name,
-        booking_ref,
-        room_number,
-        expected_guest_count,
-
-        visitor_first_name,
-        visitor_last_name,
-        visitor_phone,
-        visitor_reason,
-      } = req.body || {};
-
-      if (!session_token) return res.status(400).json({ error: "Session token required" });
-
-      const { data: sess, error: sessErr } = await supabase
-        .from("demo_sessions")
-        .select("flow_type, verified_guest_count, expected_guest_count, intake_payload")
-        .eq("session_token", session_token)
-        .single();
-
-      if (sessErr || !sess) return res.status(404).json({ error: "Session not found" });
-
-      const flow_type = normalizeFlowType(flowTypeFromBody || sess.flow_type);
-
-      if (flow_type === "visitor") {
-        const vf = String(visitor_first_name || "").trim();
-        const vl = String(visitor_last_name || "").trim();
-        const vp = String(visitor_phone || "").trim();
-        const vr = String(visitor_reason || "").trim();
-
-        if (!vf || !vl || !vp || !vr) {
-          return res.status(400).json({
-            error: "Visitor first name, last name, phone number, and reason for visiting are required",
-          });
-        }
-
-        const verified = clampInt(sess.verified_guest_count, 0, 10);
-        const expectedToSet = 1;
-
-        const nextIntake = {
-          ...(sess.intake_payload && typeof sess.intake_payload === "object" ? sess.intake_payload : {}),
-          flow_type: "visitor",
-          visitor_first_name: vf,
-          visitor_last_name: vl,
-          phone: vp,
-          reason: vr,
-        };
-
-        const { error: updateError } = await supabase
-          .from("demo_sessions")
-          .update({
-            flow_type: "visitor",
-            visitor_first_name: vf,
-            visitor_last_name: vl,
-            visitor_phone: vp,
-            visitor_reason: vr,
-            intake_payload: nextIntake,
-            status: "visitor_info_saved",
-            current_step: "document",
-            expected_guest_count: expectedToSet,
-            requires_additional_guest: verified < expectedToSet,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("session_token", session_token);
-
-        if (updateError) {
-          console.error("Error saving visitor info:", updateError);
-          return res.status(500).json({ error: "Failed to save visitor info" });
-        }
-
-        return res.json({
-          success: true,
-          build_id: BUILD_ID,
-          flow_type: "visitor",
-          expected_guest_count: expectedToSet,
-          verified_guest_count: verified,
-          requires_additional_guest: verified < expectedToSet,
-          remaining_guest_verifications: Math.max(expectedToSet - verified, 0),
-        });
-      }
-
-      const bookingValue = booking_ref || room_number || null;
-
-      if (!guest_name || !bookingValue) {
-        return res.status(400).json({ error: "Guest name and reservation number are required" });
-      }
-
-      const guestNameNorm = normalizeGuestName(guest_name);
-      const resNorm = normalizeReservationNumber(bookingValue);
-
-      const { data: matches, error: matchErr } = await supabase
-        .from("booking_email_index")
-        .select("id, adults, children")
-        .eq("guest_name_norm", guestNameNorm)
-        .or(`confirmation_number_norm.eq.${resNorm},source_reservation_id_norm.eq.${resNorm}`)
-        .limit(1);
-
-      if (matchErr) {
-        console.error("booking_email_index lookup error:", matchErr);
-        return res.status(500).json({ error: "Failed to verify reservation" });
-      }
-
-      if (!matches || matches.length === 0) {
-        return res.status(403).json({
-          error:
-            "Reservation not found. Please enter your name and reservation number exactly as shown in your confirmation email.",
-        });
-      }
-
-      const bookingRow = matches[0];
-
-      const adultsFromEmail = Number.isFinite(Number(bookingRow.adults))
-        ? Number(bookingRow.adults)
-        : 1;
-
-      const childrenFromEmail = Number.isFinite(Number(bookingRow.children))
-        ? Number(bookingRow.children)
-        : 0;
-
-      const expectedFromEmail = clampInt(adultsFromEmail, 1, 10);
-
-      const expectedOverride = toIntOrNull(expected_guest_count);
-      const expectedToSet =
-        expectedOverride === null ? expectedFromEmail : clampInt(expectedOverride, 1, 10);
-
-      const verified = clampInt(sess.verified_guest_count, 0, 10);
-
-      const nextIntake = {
-        ...(sess.intake_payload && typeof sess.intake_payload === "object" ? sess.intake_payload : {}),
-        flow_type: "guest",
-        guest_name: guest_name,
-        booking_ref: bookingValue,
-      };
-
-      const updatePayload = {
-        flow_type: "guest",
-        guest_name: guest_name || null,
-        room_number: bookingValue,
-
-        adults: clampInt(adultsFromEmail, 0, 10),
-        children: clampInt(childrenFromEmail, 0, 10),
-
-        intake_payload: nextIntake,
-
-        status: "guest_info_saved",
-        current_step: "document",
-        expected_guest_count: expectedToSet,
-        requires_additional_guest: verified < expectedToSet,
-        updated_at: new Date().toISOString(),
-      };
-
-      const { error: updateError } = await supabase
-        .from("demo_sessions")
-        .update(updatePayload)
-        .eq("session_token", session_token);
-
-      if (updateError) {
-        console.error("Error saving guest info:", updateError);
-        return res.status(500).json({ error: "Failed to save guest info" });
-      }
-
-      return res.json({
-        success: true,
-        build_id: BUILD_ID,
-        flow_type: "guest",
-        adults: clampInt(adultsFromEmail, 0, 10),
-        children: clampInt(childrenFromEmail, 0, 10),
-        expected_guest_count: expectedToSet,
-        verified_guest_count: verified,
-        requires_additional_guest: verified < expectedToSet,
-        remaining_guest_verifications: Math.max(expected - verified, 0),
-      });
-    }
-
-    if (action === "tm30_update") {
-      const { session_token, tm30_info } = req.body || {};
-      if (!session_token) return res.status(400).json({ error: "Session token required" });
-
-      const payload = tm30_info && typeof tm30_info === "object" ? tm30_info : {};
-
-      const requiredKeys = [
-        "nationality",
-        "sex",
-        "arrival_date_time",
-        "departure_date",
-        "property",
-        "room_number",
-      ];
-
-      const missing = requiredKeys.filter((k) => {
-        const v = payload[k];
-        return v === undefined || v === null || String(v).trim() === "";
-      });
-
-      const tm30_status = missing.length === 0 ? "ready" : "draft";
-
-      const { data, error } = await supabase
-        .from("demo_sessions")
-        .update({
-          tm30_info: payload,
-          tm30_status,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("session_token", session_token)
-        .select("*")
-        .single();
-
-      if (error || !data) {
-        console.error("tm30_update error:", error);
-        return res.status(500).json({ error: error?.message || "Failed to update TM30 info" });
-      }
-
-      return res.status(200).json({
-        success: true,
-        build_id: BUILD_ID,
-        tm30_status,
-        missing_fields: missing,
-        row: data,
-      });
-    }
-
-    if (action === "upload_document") {
-      const { session_token, image_data } = req.body || {};
-
-      if (!session_token) return res.status(400).json({ error: "Session token required" });
-      if (!image_data) return res.status(400).json({ error: "image_data required" });
-      if (!AWS_REGION || !BUCKET)
-        return res.status(500).json({ error: "Server misconfigured: missing AWS env vars" });
-
-      const { data: sess, error: sessErr } = await supabase
-        .from("demo_sessions")
-        .select(
-          [
-            "flow_type",
-            "guest_name",
-            "room_number",
-            "visitor_first_name",
-            "visitor_last_name",
-            "visitor_phone",
-            "visitor_reason",
-            "intake_payload",
-            "expected_guest_count",
-            "verified_guest_count",
-            "property_external_id",
-            "door_key",
-          ].join(",")
-        )
-        .eq("session_token", session_token)
-        .single();
-
-      if (sessErr || !sess) return res.status(404).json({ error: "Session not found" });
-
-      const flow_type = normalizeFlowType(sess.flow_type);
-
-      const hasGuestCols = Boolean(sess.guest_name && sess.room_number);
-      const hasVisitorCols = Boolean(
-        sess.visitor_first_name && sess.visitor_last_name && sess.visitor_phone && sess.visitor_reason
-      );
-
-      const ip = sess.intake_payload && typeof sess.intake_payload === "object" ? sess.intake_payload : null;
-
-      const hasGuestPayload = Boolean(
-        ip && isNonEmptyString(ip.guest_name) && isNonEmptyString(ip.booking_ref || ip.room_number)
-      );
-      const hasVisitorPayload = Boolean(
-        ip &&
-          isNonEmptyString(ip.visitor_first_name) &&
-          isNonEmptyString(ip.visitor_last_name) &&
-          isNonEmptyString(ip.phone) &&
-          isNonEmptyString(ip.reason)
-      );
-
-      if (flow_type === "visitor") {
-        if (!hasVisitorCols && !hasVisitorPayload) {
-          return res.status(403).json({ error: "Complete Step 1 (visitor info) first." });
-        }
-      } else {
-        if (!hasGuestCols && !hasGuestPayload) {
-          return res.status(403).json({ error: "Complete Step 1 (reservation verification) first." });
-        }
-      }
-
-      const expected = clampInt(sess.expected_guest_count, 1, 10);
-      const verifiedBefore = clampInt(sess.verified_guest_count, 0, 10);
-      const guestIndex = clampInt(verifiedBefore + 1, 1, expected);
-
-      const base64Data = normalizeBase64(image_data);
-      if (!base64Data) return res.status(400).json({ error: "Invalid image_data format" });
-
-      const imageBuffer = Buffer.from(base64Data, "base64");
-      if (imageBuffer.length < 1000) return res.status(400).json({ error: "Image too small" });
-
-      const s3Key = `demo/${session_token}/document_${guestIndex}.jpg`;
-
-      await s3.send(
-        new PutObjectCommand({
-          Bucket: BUCKET,
-          Key: s3Key,
-          Body: imageBuffer,
-          ContentType: "image/jpeg",
-        })
-      );
-
-      const documentUrl = `s3://${BUCKET}/${s3Key}`;
-
-      const nextStep = flow_type === "visitor" ? "results" : "selfie";
-      const nextStatus = flow_type === "visitor" ? "access_granted" : "document_uploaded";
-
-      let visitorAccessCode = null;
-      let grantedAt = null;
-      let expiresAt = null;
-
-      if (flow_type === "visitor") {
-        const kiosk = await getActiveKioskConfig();
-
-        const property_external_id = String(sess.property_external_id || kiosk.property_external_id);
-        const door_key = String(sess.door_key || kiosk.door_key);
-        const timezone = String(kiosk.timezone || "Asia/Bangkok");
-
-        const match = await resolveScheduledDoorCode({ property_external_id, door_key, timezone });
-        if (!match?.access_code) {
-          return res.status(500).json({
-            error: "No active door code schedule found for current time. Check door_code_schedule coverage.",
-            build_id: BUILD_ID,
-          });
-        }
-
-        visitorAccessCode = match.access_code;
-        grantedAt = new Date();
-        expiresAt = computeWindowExpiresAt(timezone, match.end_min);
-
-        await supabase
-          .from("demo_sessions")
-          .update({
-            property_external_id,
-            door_key,
-          })
-          .eq("session_token", session_token);
-      }
-
-      const { error: updateError } = await supabase
-        .from("demo_sessions")
-        .update({
-          status: nextStatus,
-          current_step: nextStep,
-          document_url: documentUrl,
-          extracted_info: {
-            text: `Textract pending (async) [guest ${guestIndex}]`,
-            textract_ok: null,
-            textract_error: null,
-            textract: null,
-            guest_index: guestIndex,
-          },
-          visitor_access_code: visitorAccessCode,
-          visitor_access_granted_at: grantedAt ? grantedAt.toISOString() : null,
-          visitor_access_expires_at: expiresAt ? expiresAt.toISOString() : null,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("session_token", session_token);
-
-      if (updateError) {
-        console.error("Error updating document session:", updateError);
-        return res.status(500).json({ error: "Failed to save document state", build_id: BUILD_ID });
-      }
-
-      runTextractAnalyzeIdWithTimeout(imageBuffer, 15000)
-        .then(async (result) => {
-          if (result.ok) {
-            const extracted = result.data;
-
-            const extractedText =
-              [
-                extracted.full_name ? `Name: ${extracted.full_name}` : null,
-                extracted.first_name ? `First: ${extracted.first_name}` : null,
-                extracted.middle_name ? `Middle: ${extracted.middle_name}` : null,
-                extracted.last_name ? `Last: ${extracted.last_name}` : null,
-                extracted.sex ? `Sex: ${extracted.sex}` : null,
-                extracted.nationality ? `Nationality: ${extracted.nationality}` : null,
-                extracted.date_of_birth ? `DOB: ${extracted.date_of_birth}` : null,
-                extracted.document_number ? `Doc#: ${extracted.document_number}` : null,
-                extracted.expiration_date ? `Exp: ${extracted.expiration_date}` : null,
-              ]
-                .filter(Boolean)
-                .join(" | ") || "Textract extracted fields";
-
-            await supabase
-              .from("demo_sessions")
-              .update({
-                extracted_info: {
-                  text: `${extractedText} [guest ${guestIndex}]`,
-                  textract_ok: true,
-                  textract_error: null,
-                  textract: extracted,
-                  guest_index: guestIndex,
-                },
-                updated_at: new Date().toISOString(),
-              })
-              .eq("session_token", session_token);
-          } else {
-            await supabase
-              .from("demo_sessions")
-              .update({
-                extracted_info: {
-                  text: `Textract failed (async) [guest ${guestIndex}]`,
-                  textract_ok: false,
-                  textract_error: result.error,
-                  textract: null,
-                  guest_index: guestIndex,
-                },
-                updated_at: new Date().toISOString(),
-              })
-              .eq("session_token", session_token);
-          }
-        })
-        .catch((e) => {
-          console.warn("Textract async crash:", e?.message || e);
-        });
-
-      return res.json({
-        success: true,
-        build_id: BUILD_ID,
-        flow_type,
-        guest_index: guestIndex,
-        extracted_text: `Textract pending (async) [guest ${guestIndex}]`,
-        visitor_access_code: visitorAccessCode,
-        visitor_access_granted_at: grantedAt ? grantedAt.toISOString() : null,
-        visitor_access_expires_at: expiresAt ? expiresAt.toISOString() : null,
-        data: {
-          extracted_text: `Textract pending (async) [guest ${guestIndex}]`,
-          guest_index: guestIndex,
-          flow_type,
-          visitor_access_code: visitorAccessCode,
-          visitor_access_granted_at: grantedAt ? grantedAt.toISOString() : null,
-          visitor_access_expires_at: expiresAt ? expiresAt.toISOString() : null,
-        },
-      });
-    }
-
     if (action === "verify_face") {
       const { session_token, selfie_data } = req.body || {};
+      if (!session_token || !selfie_data)
+        return res.status(400).json({ error: "Missing params" });
 
-      if (!session_token) return res.status(400).json({ error: "Session token required" });
-      if (!selfie_data) return res.status(400).json({ error: "selfie_data required" });
-      if (!AWS_REGION || !BUCKET)
-        return res.status(500).json({ error: "Server misconfigured: missing AWS env vars" });
-
-      const { data: session, error: sessionError } = await supabase
+      const { data: session } = await supabase
         .from("demo_sessions")
         .select("*")
         .eq("session_token", session_token)
         .single();
 
-      if (sessionError || !session) return res.status(404).json({ error: "Session not found" });
+      if (!session) return res.status(404).json({ error: "Session not found" });
 
       const flow_type = normalizeFlowType(session.flow_type);
-
       const expected = clampInt(session.expected_guest_count, 1, 10);
       const verifiedBefore = clampInt(session.verified_guest_count, 0, 10);
       const guestIndex = clampInt(verifiedBefore + 1, 1, expected);
 
       const docKey = `demo/${session_token}/document_${guestIndex}.jpg`;
+      const docObj = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: docKey }));
+      const docBuffer = await streamToBuffer(docObj.Body);
 
-      let docBuffer;
-      try {
-        const docObj = await s3.send(
-          new GetObjectCommand({
-            Bucket: BUCKET,
-            Key: docKey,
-          })
-        );
-        const docStream = docObj.Body;
-        if (!docStream) return res.status(500).json({ error: "Failed to read document from S3" });
-        docBuffer = await streamToBuffer(docStream);
-      } catch {
-        return res.status(400).json({
-          error: `Document not uploaded for guest ${guestIndex}. Please upload the ID first.`,
-        });
-      }
-
-      const selfieBase64 = normalizeBase64(selfie_data);
-      if (!selfieBase64) return res.status(400).json({ error: "Invalid selfie_data format" });
-
-      const selfieBuffer = Buffer.from(selfieBase64, "base64");
-      if (selfieBuffer.length < 1000) return res.status(400).json({ error: "Image too small" });
-
+      const selfieBuffer = Buffer.from(normalizeBase64(selfie_data), "base64");
       const selfieKey = `demo/${session_token}/selfie_${guestIndex}.jpg`;
 
       await s3.send(
@@ -1071,18 +120,15 @@ export default async function handler(req, res) {
 
       const selfieUrl = `s3://${BUCKET}/${selfieKey}`;
 
-      const livenessResult = await rekognition.send(
-        new DetectFacesCommand({
-          Image: { Bytes: selfieBuffer },
-          Attributes: ["ALL"],
-        })
+      const liveness = await rekognition.send(
+        new DetectFacesCommand({ Image: { Bytes: selfieBuffer }, Attributes: ["ALL"] })
       );
 
-      const face = livenessResult.FaceDetails?.[0];
-      const isLive = Boolean(face?.EyesOpen?.Value) && (face?.Quality?.Brightness || 0) > 40;
+      const face = liveness.FaceDetails?.[0];
+      const isLive = Boolean(face?.EyesOpen?.Value);
       const livenessScore = (face?.Confidence || 0) / 100;
 
-      const compareResult = await rekognition.send(
+      const compare = await rekognition.send(
         new CompareFacesCommand({
           SourceImage: { Bytes: selfieBuffer },
           TargetImage: { Bytes: docBuffer },
@@ -1090,88 +136,61 @@ export default async function handler(req, res) {
         })
       );
 
-      const similarity = (compareResult.FaceMatches?.[0]?.Similarity || 0) / 100;
-
+      const similarity = (compare.FaceMatches?.[0]?.Similarity || 0) / 100;
       const verificationScore = (isLive ? 0.4 : 0) + livenessScore * 0.3 + similarity * 0.3;
 
       const guest_verified = isLive && similarity >= 0.65;
-
-      let verifiedAfter = verifiedBefore;
-      if (guest_verified) verifiedAfter = Math.min(verifiedBefore + 1, expected);
+      const verifiedAfter = guest_verified
+        ? Math.min(verifiedBefore + 1, expected)
+        : verifiedBefore;
 
       const requiresAdditionalGuest = verifiedAfter < expected;
-
-      let statusToSet = "failed";
-      if (guest_verified && requiresAdditionalGuest) statusToSet = "partial_verified";
-      if (guest_verified && !requiresAdditionalGuest) statusToSet = "verified";
-
       const overallVerified = verifiedAfter >= expected;
 
-      const next_step = guest_verified
-        ? requiresAdditionalGuest
-          ? "document"
-          : "results"
-        : "selfie";
+      let physical_room = null;
+      let room_access_code = null;
+      let cloudbeds_reservation_id = null;
 
-      const { error: updateError } = await supabase
-        .from("demo_sessions")
-        .update({
-          status: statusToSet,
-          current_step: next_step,
-          selfie_url: selfieUrl,
-          document_url: `s3://${BUCKET}/${docKey}`,
-          is_verified: overallVerified,
-          verification_score: verificationScore,
-          liveness_score: livenessScore,
-          face_match_score: similarity,
-          expected_guest_count: expected,
-          verified_guest_count: verifiedAfter,
-          requires_additional_guest: requiresAdditionalGuest,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("session_token", session_token);
+      if (guest_verified && flow_type === "guest" && session.room_number) {
+        try {
+          const cloudbeds = await fetchCloudbedsReservation(session.room_number);
+          physical_room = cloudbeds.roomName || null;
+          room_access_code = cloudbeds.accessCode || null;
+          cloudbeds_reservation_id = session.room_number;
 
-      if (updateError) {
-        console.error("Error updating verification session:", updateError);
-        return res.status(500).json({ error: "Failed to save verification result", build_id: BUILD_ID });
+          await supabase.from("demo_sessions").update({
+            physical_room,
+            room_access_code,
+            cloudbeds_reservation_id,
+          }).eq("session_token", session_token);
+        } catch {}
       }
+
+      await supabase.from("demo_sessions").update({
+        selfie_url: selfieUrl,
+        is_verified: overallVerified,
+        verification_score: verificationScore,
+        liveness_score: livenessScore,
+        face_match_score: similarity,
+        verified_guest_count: verifiedAfter,
+        requires_additional_guest: requiresAdditionalGuest,
+        updated_at: new Date().toISOString(),
+      }).eq("session_token", session_token);
 
       return res.json({
         success: true,
-        build_id: BUILD_ID,
         flow_type,
-        guest_index: guestIndex,
         guest_verified,
-        advance_to_next_guest: guest_verified,
-        status: statusToSet,
-        next_step,
         is_verified: overallVerified,
-        expected_guest_count: expected,
-        verified_guest_count: verifiedAfter,
-        requires_additional_guest: requiresAdditionalGuest,
-        remaining_guest_verifications: Math.max(expected - verifiedAfter, 0),
-        data: {
-          flow_type,
-          guest_index: guestIndex,
-          guest_verified,
-          advance_to_next_guest: guest_verified,
-          status: statusToSet,
-          next_step,
-          liveness_score: livenessScore,
-          face_match_score: similarity,
-          verification_score: verificationScore,
-          is_verified: overallVerified,
-          requires_additional_guest: requiresAdditionalGuest,
-          expected_guest_count: expected,
-          verified_guest_count: verifiedAfter,
-          remaining_guest_verifications: Math.max(expected - verifiedAfter, 0),
-        },
+        verification_score: verificationScore,
+        physical_room,
+        room_access_code,
+        cloudbeds_reservation_id,
       });
     }
 
-    return res.status(400).json({ error: "Invalid action", build_id: BUILD_ID });
-  } catch (error) {
-    console.error("Error:", error);
-    return res.status(500).json({ error: error?.message || "Unknown server error", build_id: BUILD_ID });
+    return res.status(400).json({ error: "Invalid action" });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || "Server error" });
   }
 }
