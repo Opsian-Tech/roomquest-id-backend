@@ -1,5 +1,3 @@
-
-
 // pages/api/verify.js
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
@@ -21,6 +19,12 @@ const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL;
  * BUILD MARKER
  */
 const BUILD_ID = "cloudbeds-integration-v1";
+
+if (!SUPABASE_URL) console.warn("Missing env: NEXT_PUBLIC_SUPABASE_URL");
+if (!SUPABASE_SERVICE_KEY) console.warn("Missing env: SUPABASE_SERVICE_KEY");
+if (!AWS_REGION) console.warn("Missing env: AWS_REGION");
+if (!BUCKET) console.warn("Missing env: S3_BUCKET_NAME");
+if (!BACKEND_URL) console.warn("Missing env: NEXT_PUBLIC_BACKEND_URL");
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const s3 = new S3Client({ region: AWS_REGION });
@@ -91,40 +95,72 @@ function clampInt(n, min, max) {
   return Math.min(Math.max(Math.trunc(x), min), max);
 }
 
+function safeJson(res, status, payload) {
+  return res.status(status).json({ ...payload, build_id: BUILD_ID });
+}
+
 export default async function handler(req, res) {
   setCors(res);
 
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (req.method !== "POST") return safeJson(res, 405, { error: "Method not allowed" });
 
   const { action } = req.body || {};
 
   try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+      return safeJson(res, 500, { error: "Server misconfigured: missing Supabase env vars" });
+    }
+    if (!AWS_REGION || !BUCKET) {
+      return safeJson(res, 500, { error: "Server misconfigured: missing AWS env vars" });
+    }
+
     if (action === "verify_face") {
       const { session_token, selfie_data } = req.body || {};
-      if (!session_token || !selfie_data)
-        return res.status(400).json({ error: "Missing params" });
+      if (!session_token || !selfie_data) {
+        return safeJson(res, 400, { error: "Missing params" });
+      }
 
-      const { data: session } = await supabase
+      const { data: session, error: sessionErr } = await supabase
         .from("demo_sessions")
         .select("*")
         .eq("session_token", session_token)
         .single();
 
-      if (!session) return res.status(404).json({ error: "Session not found" });
+      if (sessionErr) {
+        console.error("[verify.js] session lookup error:", sessionErr);
+        return safeJson(res, 500, { error: "Failed to load session" });
+      }
+      if (!session) return safeJson(res, 404, { error: "Session not found" });
 
       const flow_type = normalizeFlowType(session.flow_type);
       const expected = clampInt(session.expected_guest_count, 1, 10);
       const verifiedBefore = clampInt(session.verified_guest_count, 0, 10);
       const guestIndex = clampInt(verifiedBefore + 1, 1, expected);
 
+      // Read the uploaded document image from S3
       const docKey = `demo/${session_token}/document_${guestIndex}.jpg`;
-      const docObj = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: docKey }));
-      const docBuffer = await streamToBuffer(docObj.Body);
 
-      const selfieBuffer = Buffer.from(normalizeBase64(selfie_data), "base64");
+      let docBuffer;
+      try {
+        const docObj = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: docKey }));
+        if (!docObj?.Body) return safeJson(res, 500, { error: "Failed to read document from S3" });
+        docBuffer = await streamToBuffer(docObj.Body);
+      } catch (e) {
+        return safeJson(res, 400, {
+          error: `Document not uploaded for guest ${guestIndex}. Please upload the ID first.`,
+        });
+      }
+
+      // Decode selfie
+      const selfieBase64 = normalizeBase64(selfie_data);
+      if (!selfieBase64) return safeJson(res, 400, { error: "Invalid selfie_data format" });
+
+      const selfieBuffer = Buffer.from(selfieBase64, "base64");
+      if (selfieBuffer.length < 1000) return safeJson(res, 400, { error: "Image too small" });
+
+      // Upload selfie to S3
       const selfieKey = `demo/${session_token}/selfie_${guestIndex}.jpg`;
-
       await s3.send(
         new PutObjectCommand({
           Bucket: BUCKET,
@@ -136,6 +172,7 @@ export default async function handler(req, res) {
 
       const selfieUrl = `s3://${BUCKET}/${selfieKey}`;
 
+      // Liveness-ish signal (basic)
       const liveness = await rekognition.send(
         new DetectFacesCommand({ Image: { Bytes: selfieBuffer }, Attributes: ["ALL"] })
       );
@@ -144,6 +181,7 @@ export default async function handler(req, res) {
       const isLive = Boolean(face?.EyesOpen?.Value);
       const livenessScore = (face?.Confidence || 0) / 100;
 
+      // Face match
       const compare = await rekognition.send(
         new CompareFacesCommand({
           SourceImage: { Bytes: selfieBuffer },
@@ -153,9 +191,11 @@ export default async function handler(req, res) {
       );
 
       const similarity = (compare.FaceMatches?.[0]?.Similarity || 0) / 100;
+
       const verificationScore = (isLive ? 0.4 : 0) + livenessScore * 0.3 + similarity * 0.3;
 
       const guest_verified = isLive && similarity >= 0.65;
+
       const verifiedAfter = guest_verified
         ? Math.min(verifiedBefore + 1, expected)
         : verifiedBefore;
@@ -168,48 +208,61 @@ export default async function handler(req, res) {
       let room_access_code = null;
       let cloudbeds_reservation_id = null;
 
-      if (guest_verified && flow_type === "guest" && session.room_number) {
+      if (guest_verified && flow_type === "guest" && session.room_number && BACKEND_URL) {
         try {
           const cloudbeds = await fetchCloudbedsReservation(session.room_number);
           physical_room = cloudbeds.roomName || null;
           room_access_code = cloudbeds.accessCode || null;
           cloudbeds_reservation_id = session.room_number;
         } catch (cbErr) {
-          console.error("[Cloudbeds] Lookup failed:", cbErr.message);
+          console.error("[Cloudbeds] Lookup failed:", cbErr?.message || cbErr);
           // Continue without Cloudbeds data - guest is still verified
         }
       }
 
       // Single combined database update
-      await supabase.from("demo_sessions").update({
-        selfie_url: selfieUrl,
-        is_verified: overallVerified,
-        verification_score: verificationScore,
-        liveness_score: livenessScore,
-        face_match_score: similarity,
-        verified_guest_count: verifiedAfter,
-        requires_additional_guest: requiresAdditionalGuest,
-        physical_room,
-        room_access_code,
-        cloudbeds_reservation_id,
-        updated_at: new Date().toISOString(),
-      }).eq("session_token", session_token);
+      const { error: updateErr } = await supabase
+        .from("demo_sessions")
+        .update({
+          selfie_url: selfieUrl,
+          document_url: `s3://${BUCKET}/${docKey}`,
+          is_verified: overallVerified,
+          verification_score: verificationScore,
+          liveness_score: livenessScore,
+          face_match_score: similarity,
+          verified_guest_count: verifiedAfter,
+          requires_additional_guest: requiresAdditionalGuest,
+          physical_room,
+          room_access_code,
+          cloudbeds_reservation_id,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("session_token", session_token);
 
-      return res.json({
+      if (updateErr) {
+        console.error("[verify.js] update error:", updateErr);
+        return safeJson(res, 500, { error: "Failed to save verification result" });
+      }
+
+      return safeJson(res, 200, {
         success: true,
         flow_type,
+        guest_index: guestIndex,
         guest_verified,
         is_verified: overallVerified,
         verification_score: verificationScore,
         physical_room,
         room_access_code,
         cloudbeds_reservation_id,
+        requires_additional_guest: requiresAdditionalGuest,
+        verified_guest_count: verifiedAfter,
+        expected_guest_count: expected,
       });
     }
 
-    return res.status(400).json({ error: "Invalid action" });
+    return safeJson(res, 400, { error: "Invalid action" });
   } catch (e) {
     console.error("[verify.js] Error:", e);
-    return res.status(500).json({ error: e.message || "Server error" });
+    return safeJson(res, 500, { error: e?.message || "Server error" });
   }
 }
