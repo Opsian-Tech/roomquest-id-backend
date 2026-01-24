@@ -441,10 +441,6 @@ export default async function handler(req, res) {
 // ACTION: verify_guest
 // ============================================
 
-// syedmuhammadosama@Syeds-MacBook-Pro roomquest-id-backend % curl -X POST http://localhost:3000/api/cloudbeds/reservation \
-//   -H "Content-Type: application/json" \
-//   -d '{"reservation_id": "4257TZGWU9"}'
-// {"success":true,"reservationId":"4257TZGWU9","roomName":"203","accessCode":null,"guestName":"Thiraphong Saethan","checkInDate":"2026-01-24","checkOutDate":"2026-01-26","status":"confirmed"}%  
 // ============================================
 // ACTION: update_guest
 // ============================================
