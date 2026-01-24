@@ -437,10 +437,6 @@ export default async function handler(req, res) {
 
       return safeJson(res, 200, { success: true, message: "Consent logged successfully" });
     }
-    // ============================================
-// ACTION: verify_guest
-// ============================================
-
 // ============================================
 // ACTION: update_guest
 // ============================================
