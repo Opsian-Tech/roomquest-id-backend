@@ -1,7 +1,5 @@
 // pages/api/cloudbeds/reservation.js
-// ✅ FIXED: Using API Key authentication instead of OAuth 2.0
-
-const CLOUDBEDS_API_KEY = process.env.CLOUDBEDS_API_KEY;
+const CLOUDBED_API_KEY = process.env.CLOUDBEDS_API_KEY;
 const CLOUDBEDS_PROPERTY_ID = process.env.CLOUDBEDS_PROPERTY_EXTERNAL_ID;
 const CLOUDBEDS_API_BASE = "https://hotels.cloudbeds.com/api/v1.2";
 
@@ -15,6 +13,55 @@ function setCors(res) {
   );
 }
 
+async function findReservationByAnyId(searchId) {
+  const headers = {
+    "Authorization": `Bearer ${CLOUDBED_API_KEY}`,
+    "Content-Type": "application/json",
+  };
+
+  // Step 1: Try direct CloudBeds reservation ID lookup
+  try {
+    const directUrl = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${searchId}`;
+    const res = await fetch(directUrl, { headers });
+    const data = await res.json();
+    
+    if (data.success) {
+      console.log("[Cloudbeds] Found by direct reservationID");
+      return data.data;
+    }
+  } catch (e) {
+    console.log("[Cloudbeds] Direct lookup failed, searching all reservations");
+  }
+
+  // Step 2: Search through all reservations for thirdPartyIdentifier (Agoda/Expedia ID)
+  const listUrl = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${CLOUDBEDS_PROPERTY_ID}`;
+  const res = await fetch(listUrl, { headers });
+  const data = await res.json();
+  
+  if (!data.success || !data.data) {
+    throw new Error("Failed to fetch reservations");
+  }
+
+  // Search for matching thirdPartyIdentifier or reservationID
+  const found = data.data.find(r => 
+    r.reservationID === searchId || 
+    r.thirdPartyIdentifier === searchId
+  );
+  
+  if (!found) {
+    throw new Error("Reservation not found");
+  }
+
+  console.log("[Cloudbeds] Found by thirdPartyIdentifier:", found.reservationID);
+  
+  // Now get full details using the CloudBeds reservationID
+  const detailUrl = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${found.reservationID}`;
+  const detailRes = await fetch(detailUrl, { headers });
+  const detailData = await detailRes.json();
+  
+  return detailData.success ? detailData.data : found;
+}
+
 export default async function handler(req, res) {
   setCors(res);
 
@@ -22,113 +69,41 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    if (!CLOUDBEDS_API_KEY) {
+    if (!CLOUDBED_API_KEY) {
       return res.status(500).json({ error: "Missing CLOUDBED_API_KEY" });
     }
 
-    if (!CLOUDBEDS_PROPERTY_ID) {
-      return res.status(500).json({ error: "Missing CLOUDBED_PROPERTY_ID" });
-    }
-
     const { reservation_id } = req.body || {};
-
     if (!reservation_id) {
       return res.status(400).json({ error: "Missing reservation_id" });
     }
 
-    console.log("[Cloudbeds] Looking up reservation:", reservation_id);
+    console.log("[Cloudbeds] Searching for:", reservation_id);
 
-    // ✅ FIXED: Simple API Key authentication - no OAuth tokens needed!
-    const headers = {
-      "Authorization": `Bearer ${CLOUDBEDS_API_KEY}`,
-      "Content-Type": "application/json",
-    };
-
-    // 1. Get reservation details from CloudBeds
-    const reservationUrl = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${encodeURIComponent(reservation_id)}`;
-    console.log("[Cloudbeds] Fetching reservation from:", reservationUrl);
-
-    const reservationRes = await fetch(reservationUrl, { headers });
-    const reservationData = await reservationRes.json();
-
-    if (!reservationRes.ok || !reservationData.success) {
-      console.error("[Cloudbeds] getReservation failed:", reservationData);
-      return res.status(404).json({
-        success: false,
-        error: "Reservation not found",
-        details: reservationData.message || "Unknown error",
-      });
-    }
-
-    console.log("[Cloudbeds] Reservation found:", {
-      guestName: reservationData.data?.guestName,
-      status: reservationData.data?.status,
-      assignedRooms: reservationData.data?.assigned?.length || 0,
-    });
-
-    // 2. Extract room name from assigned rooms array
-    const assigned = reservationData.data?.assigned || [];
+    const reservation = await findReservationByAnyId(reservation_id);
+    
+    const assigned = reservation.assigned || [];
     let roomName = null;
-
     if (assigned.length > 0) {
       roomName = assigned[0].roomName || assigned[0].roomTypeName || null;
-      console.log("[Cloudbeds] Room assignment found:", roomName);
-    } else {
-      console.log("[Cloudbeds] No room assigned yet");
     }
 
-    // 3. Get door lock access code (TT Lock integration)
-    let accessCode = null;
-
-    try {
-      // Try CloudBeds door lock API if integrated
-      const keysUrl = `https://api.cloudbeds.com/v2/keys?reservationId=${encodeURIComponent(reservation_id)}`;
-      console.log("[Cloudbeds] Fetching door lock keys from:", keysUrl);
-
-      const keysRes = await fetch(keysUrl, { headers });
-
-      if (keysRes.ok) {
-        const keysData = await keysRes.json();
-        console.log("[Cloudbeds] Door lock response:", JSON.stringify(keysData));
-
-        const keys = keysData.data || keysData.keys || [];
-
-        if (Array.isArray(keys) && keys.length > 0) {
-          accessCode = keys[0].pin || keys[0].code || keys[0].accessCode || keys[0].pinCode || null;
-          console.log("[Cloudbeds] Access code found:", accessCode ? "Yes" : "No");
-        } else {
-          console.log("[Cloudbeds] No door lock keys found for reservation");
-        }
-      } else {
-        const keysError = await keysRes.text();
-        console.warn("[Cloudbeds] Door lock API error:", keysRes.status, keysError);
-      }
-    } catch (doorErr) {
-      console.warn("[Cloudbeds] Door lock API exception (non-fatal):", doorErr.message);
-    }
-
-    // 4. Return the combined data
     const result = {
       success: true,
-      reservationId: reservation_id,
+      reservationId: reservation.reservationID,
       roomName,
-      accessCode,
-      guestName: reservationData.data?.guestName || null,
-      checkInDate: reservationData.data?.startDate || null,
-      checkOutDate: reservationData.data?.endDate || null,
-      status: reservationData.data?.status || null,
+      accessCode: null, // You'll handle this separately
+      guestName: reservation.guestName || null,
+      checkInDate: reservation.startDate || null,
+      checkOutDate: reservation.endDate || null,
+      status: reservation.status || null,
     };
 
-    console.log("[Cloudbeds] Returning result:", {
-      roomName: result.roomName,
-      accessCode: result.accessCode ? "***" : null,
-      guestName: result.guestName,
-    });
-
+    console.log("[Cloudbeds] Success:", result);
     return res.status(200).json(result);
 
   } catch (e) {
-    console.error("[Cloudbeds] Reservation lookup error:", e);
+    console.error("[Cloudbeds] Error:", e);
     return res.status(500).json({
       success: false,
       error: e.message || "Server error",
