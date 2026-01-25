@@ -136,101 +136,101 @@ export default async function handler(req, res) {
     }
 
     // ✅ Added: get_session so the frontend can read physical_room + room_access_code
-    if (action === "get_session") {
-      const { session_token } = req.body || {};
-      if (!session_token) return safeJson(res, 400, { error: "Session token required" });
+if (action === "get_session") {
+  const { session_token } = req.body || {};
+  if (!session_token) return safeJson(res, 400, { error: "Session token required" });
 
-      const { data: session, error: sessionErr } = await supabase
-        .from("demo_sessions")
-        .select(
-          [
-            "session_token",
-            "flow_type",
-            "status",
-            "current_step",
-            "consent_given",
-            "consent_time",
-            "consent_locale",
-            "guest_name",
-            "room_number",
-            "adults",
-            "children",
-            "visitor_first_name",
-            "visitor_last_name",
-            "visitor_phone",
-            "visitor_reason",
-            "intake_payload",
-            "document_url",
-            "selfie_url",
-            "is_verified",
-            "verification_score",
-            "liveness_score",
-            "face_match_score",
-            "expected_guest_count",
-            "verified_guest_count",
-            "requires_additional_guest",
-            "physical_room",
-            "room_access_code",
-            "cloudbeds_reservation_id",
-            "created_at",
-            "updated_at",
-          ].join(",")
-        )
-        .eq("session_token", session_token)
-        .single();
+  const { data: session, error: sessionErr } = await supabase
+    .from("demo_sessions")
+    .select(
+      [
+        "session_token",
+        "flow_type",
+        "status",
+        "current_step",
+        "consent_given",
+        "consent_time",
+        "consent_locale",
+        "guest_name",
+        "room_number",
+        "adults",
+        "children",
+        "visitor_first_name",
+        "visitor_last_name",
+        "visitor_phone",
+        "visitor_reason",
+        "intake_payload",
+        "document_url",
+        "selfie_url",
+        "is_verified",
+        "verification_score",
+        "liveness_score",
+        "face_match_score",
+        "expected_guest_count",
+        "verified_guest_count",
+        "requires_additional_guest",
+        "physical_room",
+        "room_access_code",
+        "cloudbeds_reservation_id",
+        "created_at",
+        "updated_at",
+      ].join(",")
+    )
+    .eq("session_token", session_token)
+    .single();
 
-      if (sessionErr) {
-        console.error("[verify.js] get_session lookup error:", sessionErr);
-        return safeJson(res, 500, { error: "Failed to load session" });
-      }
-      if (!session) return safeJson(res, 404, { error: "Session not found" });
+  if (sessionErr) {
+    console.error("[verify.js] get_session lookup error:", sessionErr);
+    return safeJson(res, 500, { error: "Failed to load session" });
+  }
+  if (!session) return safeJson(res, 404, { error: "Session not found" });
 
-      return safeJson(res, 200, {
-        success: true,
-        session: {
-          session_token: session.session_token,
-          flow_type: session.flow_type ?? null,
-          status: session.status ?? null,
-          current_step: session.current_step ?? null,
+  return safeJson(res, 200, {
+    success: true,
+    session: {
+      session_token: session.session_token,
+      flow_type: session.flow_type ?? null,
+      status: session.status ?? null,
+      current_step: session.current_step ?? null,
 
-          consent_given: session.consent_given ?? null,
-          consent_time: session.consent_time ?? null,
-          consent_locale: session.consent_locale ?? null,
+      consent_given: session.consent_given ?? null,
+      consent_time: session.consent_time ?? null,
+      consent_locale: session.consent_locale ?? null,
 
-          guest_name: session.guest_name ?? null,
-          room_number: session.room_number ?? null,
-          adults: session.adults ?? null,
-          children: session.children ?? null,
+      guest_name: session.guest_name ?? null,
+      room_number: session.room_number ?? null,
+      adults: session.adults ?? null,
+      children: session.children ?? null,
 
-          visitor_first_name: session.visitor_first_name ?? null,
-          visitor_last_name: session.visitor_last_name ?? null,
-          visitor_phone: session.visitor_phone ?? null,
-          visitor_reason: session.visitor_reason ?? null,
+      visitor_first_name: session.visitor_first_name ?? null,
+      visitor_last_name: session.visitor_last_name ?? null,
+      visitor_phone: session.visitor_phone ?? null,
+      visitor_reason: session.visitor_reason ?? null,
 
-          intake_payload: session.intake_payload ?? null,
+      intake_payload: session.intake_payload ?? null,
 
-          document_uploaded: Boolean(session.document_url),
-          selfie_uploaded: Boolean(session.selfie_url),
+      document_uploaded: Boolean(session.document_url),
+      selfie_uploaded: Boolean(session.selfie_url),
 
-          is_verified: session.is_verified ?? null,
-          verification_score: session.verification_score ?? null,
-          liveness_score: session.liveness_score ?? null,
-          face_match_score: session.face_match_score ?? null,
+      is_verified: session.is_verified ?? null,
+      verification_score: session.verification_score ?? null,
+      liveness_score: session.liveness_score ?? null,
+      face_match_score: session.face_match_score ?? null,
 
-          expected_guest_count: session.expected_guest_count ?? null,
-          verified_guest_count: session.verified_guest_count ?? null,
-          requires_additional_guest: session.requires_additional_guest ?? null,
+      expected_guest_count: session.expected_guest_count ?? null,
+      verified_guest_count: session.verified_guest_count ?? null,
+      requires_additional_guest: session.requires_additional_guest ?? null,
 
-          // ✅ These are what your ResultsStep wants
-          physical_room: session.physical_room ?? null,
-          room_access_code: session.room_access_code ?? null,
-          cloudbeds_reservation_id: session.cloudbeds_reservation_id ?? null,
+      // ✅ These are what your ResultsStep wants
+      physical_room: session.physical_room ?? null,
+      roomAccessCode: session.room_access_code ?? null,  // ✅ Changed to camelCase for frontend
+      cloudbeds_reservation_id: session.cloudbeds_reservation_id ?? null,
 
-          created_at: session.created_at ?? null,
-          updated_at: session.updated_at ?? null,
-        },
-      });
-    }
+      created_at: session.created_at ?? null,
+      updated_at: session.updated_at ?? null,
+    },
+  });
+}
 
     if (action === "verify_face") {
       const { session_token, selfie_data } = req.body || {};

@@ -82,17 +82,26 @@ export default async function handler(req, res) {
 
     const reservation = await findReservationByAnyId(reservation_id);
     
+    // Extract room name
     const assigned = reservation.assigned || [];
     let roomName = null;
     if (assigned.length > 0) {
       roomName = assigned[0].roomName || assigned[0].roomTypeName || null;
     }
 
+    // Extract door code from customFields
+    let accessCode = null;
+    const customFields = reservation.customFields || [];
+    const doorCodeField = customFields.find(f => f.customFieldName === "Door Code");
+    if (doorCodeField) {
+      accessCode = doorCodeField.customFieldValue;
+    }
+
     const result = {
       success: true,
       reservationId: reservation.reservationID,
       roomName,
-      accessCode: null, // You'll handle this separately
+      accessCode,
       guestName: reservation.guestName || null,
       checkInDate: reservation.startDate || null,
       checkOutDate: reservation.endDate || null,
