@@ -73,7 +73,12 @@ async function fetchCloudbedsReservation(reservationId) {
     throw new Error("Invalid Cloudbeds response");
   }
 
-  console.log("[Cloudbeds] Success:", { roomName: data.roomName, accessCode: data.accessCode });
+  console.log("[Cloudbeds] Success:", {
+    roomName: data.roomName,
+    accessCode: data.accessCode,
+    checkedIn: data.checkedIn ?? data.isCheckedIn ?? data.guestIsCheckedIn,
+  });
+
   return data;
 }
 
@@ -94,6 +99,27 @@ function generateToken() {
 function generateSixDigitCode() {
   // 000000 - 999999
   return String(crypto.randomInt(0, 1_000_000)).padStart(6, "0");
+}
+
+function getGuestIsCheckedIn(cloudbeds) {
+  // Backward compatible: if backend doesn't provide a checked-in signal, assume OK.
+  const v =
+    cloudbeds?.guestIsCheckedIn ??
+    cloudbeds?.isCheckedIn ??
+    cloudbeds?.checkedIn ??
+    cloudbeds?.reservationCheckedIn ??
+    cloudbeds?.is_checked_in ??
+    cloudbeds?.checked_in;
+
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v === 1;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (["true", "yes", "y", "checkedin", "checked_in", "checked-in", "1"].includes(s)) return true;
+    if (["false", "no", "n", "notcheckedin", "not_checked_in", "not-checked-in", "0"].includes(s))
+      return false;
+  }
+  return true;
 }
 
 async function streamToBuffer(readable) {
@@ -140,7 +166,9 @@ export default async function handler(req, res) {
       return safeJson(res, 500, { error: "Server misconfigured: missing AWS env vars" });
     }
 
-    // ✅ Added: get_session so the frontend can read physical_room + room_access_code
+    // ============================================
+    // ACTION: get_session
+    // ============================================
     if (action === "get_session") {
       const { session_token } = req.body || {};
       if (!session_token) return safeJson(res, 400, { error: "Session token required" });
@@ -177,7 +205,6 @@ export default async function handler(req, res) {
             "physical_room",
             "room_access_code",
             "cloudbeds_reservation_id",
-            // visitor access fields (safe to include even if null / column missing in older rows)
             "visitor_access_code",
             "visitor_access_granted_at",
             "visitor_access_expires_at",
@@ -230,12 +257,10 @@ export default async function handler(req, res) {
           verified_guest_count: session.verified_guest_count ?? null,
           requires_additional_guest: session.requires_additional_guest ?? null,
 
-          // ✅ These are what your ResultsStep wants
           physical_room: session.physical_room ?? null,
-          roomAccessCode: session.room_access_code ?? null, // ✅ camelCase for frontend
+          roomAccessCode: session.room_access_code ?? null,
           cloudbeds_reservation_id: session.cloudbeds_reservation_id ?? null,
 
-          // ✅ Visitor access code fields
           visitor_access_code: session.visitor_access_code ?? null,
           visitor_access_granted_at: session.visitor_access_granted_at ?? null,
           visitor_access_expires_at: session.visitor_access_expires_at ?? null,
@@ -246,6 +271,9 @@ export default async function handler(req, res) {
       });
     }
 
+    // ============================================
+    // ACTION: verify_face (UPDATED)
+    // ============================================
     if (action === "verify_face") {
       const { session_token, selfie_data } = req.body || {};
       if (!session_token || !selfie_data) {
@@ -264,9 +292,10 @@ export default async function handler(req, res) {
       }
       if (!session) return safeJson(res, 404, { error: "Session not found" });
 
+      // ✅ Get the session's flow type first (default guest via normalize)
       const flow_type = normalizeFlowType(session.flow_type);
 
-      // ✅ Guard: visitors should never do face verification
+      // ✅ Visitors should never reach this, but guard anyway
       if (flow_type === "visitor") {
         return safeJson(res, 400, { error: "Face verification not required for visitors" });
       }
@@ -338,10 +367,17 @@ export default async function handler(req, res) {
       let room_access_code = null;
       let cloudbeds_reservation_id = null;
 
-      // ✅ Cloudbeds integration is GUEST ONLY
+      // ✅ Only run Cloudbeds checks for GUEST flow
       if (guest_verified && flow_type === "guest" && session.room_number && BACKEND_URL) {
         try {
           const cloudbeds = await fetchCloudbedsReservation(session.room_number);
+
+          // ✅ Check-in validation (GUEST ONLY) -> only error message here
+          const guestIsCheckedIn = getGuestIsCheckedIn(cloudbeds);
+          if (!guestIsCheckedIn) {
+            return safeJson(res, 400, { error: "guest check in required" });
+          }
+
           physical_room = cloudbeds.roomName || null;
           room_access_code = cloudbeds.accessCode || null;
           cloudbeds_reservation_id = session.room_number;
@@ -461,7 +497,7 @@ export default async function handler(req, res) {
     }
 
     // ============================================
-    // ACTION: update_guest
+    // ACTION: update_guest (UPDATED)
     // ============================================
     if (action === "update_guest") {
       const { session_token, guest_name, booking_ref } = req.body || {};
@@ -470,7 +506,7 @@ export default async function handler(req, res) {
       if (!guest_name) return safeJson(res, 400, { error: "Guest name required" });
       if (!booking_ref) return safeJson(res, 400, { error: "Booking reference required" });
 
-      // ✅ Guard: ONLY guest flow can call Cloudbeds / update_guest
+      // ✅ Get the session's flow type first
       const { data: sess, error: sessErr } = await supabase
         .from("demo_sessions")
         .select("flow_type")
@@ -479,20 +515,23 @@ export default async function handler(req, res) {
 
       if (sessErr || !sess) return safeJson(res, 404, { error: "Session not found" });
 
-      const flow_type = normalizeFlowType(sess.flow_type);
-      if (flow_type === "visitor") {
+      const flowType = normalizeFlowType(sess.flow_type); // default guest
+
+      // ✅ For VISITOR flow, skip Cloudbeds entirely
+      if (flowType === "visitor") {
         return safeJson(res, 400, { error: "Guest check-in not applicable for visitor flow" });
       }
 
-      // Verify reservation exists in CloudBeds (GUEST ONLY)
+      // ✅ Only run Cloudbeds checks for GUEST flow
       try {
         const cloudbeds = await fetchCloudbedsReservation(booking_ref);
 
-        if (!cloudbeds.success) {
-          return safeJson(res, 404, { error: "Reservation not found" });
+        // ✅ Check reservation check-in status (only if backend provides it)
+        const guestIsCheckedIn = getGuestIsCheckedIn(cloudbeds);
+        if (!guestIsCheckedIn) {
+          return safeJson(res, 400, { error: "guest check in required" });
         }
 
-        // Update session with reservation details
         const { error: updateErr } = await supabase
           .from("demo_sessions")
           .update({
@@ -554,7 +593,7 @@ export default async function handler(req, res) {
     }
 
     // ============================================
-    // ACTION: upload_document
+    // ACTION: upload_document (UPDATED)
     // ============================================
     if (action === "upload_document") {
       const { session_token, image_data } = req.body || {};
@@ -562,6 +601,7 @@ export default async function handler(req, res) {
       if (!session_token) return safeJson(res, 400, { error: "Session token required" });
       if (!image_data) return safeJson(res, 400, { error: "image_data required" });
 
+      // Get session first (flow type is the key)
       const { data: sess, error: sessErr } = await supabase
         .from("demo_sessions")
         .select("flow_type, expected_guest_count, verified_guest_count")
@@ -570,7 +610,7 @@ export default async function handler(req, res) {
 
       if (sessErr || !sess) return safeJson(res, 404, { error: "Session not found" });
 
-      const flow_type = normalizeFlowType(sess.flow_type);
+      const flowType = normalizeFlowType(sess.flow_type); // default guest
 
       const base64Data = normalizeBase64(image_data);
       if (!base64Data) return safeJson(res, 400, { error: "Invalid image_data format" });
@@ -578,10 +618,10 @@ export default async function handler(req, res) {
       const imageBuffer = Buffer.from(base64Data, "base64");
       if (imageBuffer.length < 1000) return safeJson(res, 400, { error: "Image too small" });
 
-      // Visitor uses document_1 always
       const expected = clampInt(sess.expected_guest_count, 0, 10);
       const verifiedBefore = clampInt(sess.verified_guest_count, 0, 10);
-      const guestIndex = flow_type === "visitor" ? 1 : clampInt(verifiedBefore + 1, 1, expected || 1);
+      const guestIndex =
+        flowType === "visitor" ? 1 : clampInt(verifiedBefore + 1, 1, expected || 1);
 
       const s3Key = `demo/${session_token}/document_${guestIndex}.jpg`;
 
@@ -596,8 +636,8 @@ export default async function handler(req, res) {
 
       const documentUrl = `s3://${BUCKET}/${s3Key}`;
 
-      // ✅ Visitor flow: generate access code immediately (NO Cloudbeds)
-      if (flow_type === "visitor") {
+      // ✅ For VISITOR flow, skip Cloudbeds entirely & generate 6-digit access code
+      if (flowType === "visitor") {
         const accessCode = generateSixDigitCode();
         const grantedAt = new Date();
         const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
@@ -622,14 +662,14 @@ export default async function handler(req, res) {
 
         return safeJson(res, 200, {
           success: true,
-          flow_type,
+          flow_type: flowType,
           visitor_access_code: accessCode,
           visitor_access_granted_at: grantedAt.toISOString(),
           visitor_access_expires_at: expiresAt.toISOString(),
         });
       }
 
-      // ✅ Guest flow (unchanged)
+      // ✅ Guest flow continues (no Cloudbeds here; Cloudbeds check happens in update_guest/verify_face)
       const { error: updateErr } = await supabase
         .from("demo_sessions")
         .update({
@@ -647,7 +687,7 @@ export default async function handler(req, res) {
 
       return safeJson(res, 200, {
         success: true,
-        flow_type,
+        flow_type: flowType,
         guest_index: guestIndex,
       });
     }
