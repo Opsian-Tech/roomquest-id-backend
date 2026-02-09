@@ -500,7 +500,7 @@ export default async function handler(req, res) {
     // ACTION: update_guest (UPDATED)
     // ============================================
     if (action === "update_guest") {
-      const { session_token, guest_name, booking_ref } = req.body || {};
+      const { session_token, guest_name, booking_ref, flow_type } = req.body || {};
 
       if (!session_token) return safeJson(res, 400, { error: "Session token required" });
       if (!guest_name) return safeJson(res, 400, { error: "Guest name required" });
