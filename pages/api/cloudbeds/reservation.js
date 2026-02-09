@@ -45,7 +45,9 @@ export default async function handler(req, res) {
       const mainId = sub_reservation_id.split("-")[0];
       url += `reservationID=${mainId}`;
     }
-
+  // thirdPartyIdentifier requires getReservations (plural), not getReservation
+  url = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${CLOUDBEDS_PROPERTY_ID}&thirdPartyIdentifier=${third_party_identifier}`;
+}
     console.log("[Cloudbeds] Fetching:", url);
 
     const cbRes = await fetch(url, { headers });
