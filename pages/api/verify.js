@@ -504,7 +504,7 @@ export default async function handler(req, res) {
 
       if (!session_token) return safeJson(res, 400, { error: "Session token required" });
       if (!guest_name) return safeJson(res, 400, { error: "Guest name required" });
-      if (!booking_ref) return safeJson(res, 400, { error: "Booking reference required" });
+     if (flowType !== "visitor" && !booking_ref) return safeJson(res, 400, { error: "Booking reference required" });
 
       // ✅ Get the session's flow type first
       const { data: sess, error: sessErr } = await supabase
