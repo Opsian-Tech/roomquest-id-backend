@@ -35,23 +35,21 @@ export default async function handler(req, res) {
       "Content-Type": "application/json",
     };
 
-    let url = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&`;
+    let url;
 
-    if (reservation_id) {
-      url += `reservationID=${reservation_id}`;
-    } else if (third_party_identifier) {
-      url += `thirdPartyIdentifier=${third_party_identifier}`;
+    if (third_party_identifier) {
+      // thirdPartyIdentifier requires getReservations (plural)
+      url = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${CLOUDBEDS_PROPERTY_ID}&thirdPartyIdentifier=${third_party_identifier}`;
     } else if (sub_reservation_id) {
       const mainId = sub_reservation_id.split("-")[0];
-      url += `reservationID=${mainId}`;
+      url = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${mainId}`;
+    } else {
+      url = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${reservation_id}`;
     }
-  // thirdPartyIdentifier requires getReservations (plural), not getReservation
-  url = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${CLOUDBEDS_PROPERTY_ID}&thirdPartyIdentifier=${third_party_identifier}`;
-}
+
     console.log("[Cloudbeds] Fetching:", url);
 
     const cbRes = await fetch(url, { headers });
-
     if (!cbRes.ok) {
       const errText = await cbRes.text();
       console.error("[Cloudbeds] API error:", cbRes.status, errText);
@@ -59,12 +57,16 @@ export default async function handler(req, res) {
     }
 
     const cbData = await cbRes.json();
-
     if (!cbData.success || !cbData.data) {
       throw new Error("Reservation not found");
     }
 
-    const reservation = cbData.data;
+    // getReservations returns an array, getReservation returns an object
+    let reservation = cbData.data;
+    if (Array.isArray(reservation)) {
+      if (reservation.length === 0) throw new Error("Reservation not found");
+      reservation = reservation[0];
+    }
 
     // If sub_reservation_id was used, find the matching sub-reservation
     let assigned = reservation.assigned || [];
@@ -75,13 +77,11 @@ export default async function handler(req, res) {
       if (subMatch) assigned = [subMatch];
     }
 
-    // Extract room name
     let roomName = null;
     if (assigned.length > 0) {
       roomName = assigned[0].roomName || assigned[0].roomTypeName || null;
     }
 
-    // Extract door code from customFields
     let accessCode = null;
     const customFields = reservation.customFields || [];
     const doorCodeField = customFields.find((f) => f.customFieldName === "Door Code");
@@ -102,6 +102,7 @@ export default async function handler(req, res) {
 
     console.log("[Cloudbeds] Success:", result);
     return res.status(200).json(result);
+
   } catch (e) {
     console.error("[Cloudbeds] Error:", e);
     return res.status(500).json({
