@@ -354,7 +354,7 @@ export default async function handler(req, res) {
       const similarity = (compare.FaceMatches?.[0]?.Similarity || 0) / 100;
       const verificationScore = (isLive ? 0.4 : 0) + livenessScore * 0.3 + similarity * 0.3;
 
-      const guest_verified = isLive && similarity >= 0.65;
+      const guest_verified = isLive && similarity >= 0.45;
 
       const verifiedAfter = guest_verified
         ? Math.min(verifiedBefore + 1, expected)
