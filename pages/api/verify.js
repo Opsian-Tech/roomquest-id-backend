@@ -51,35 +51,43 @@ const textract = new TextractClient({
   },
 });
 
-async function fetchCloudbedsReservation(reservationId) {
-  console.log("[Cloudbeds] Fetching reservation:", reservationId);
+async function fetchCloudbedsReservation(bookingRef) {
+  console.log("[Cloudbeds] Fetching reservation:", bookingRef);
 
-  const res = await fetch(`${BACKEND_URL}/api/cloudbeds/reservation`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ reservation_id: reservationId }),
-  });
+  // Try reservationID first, then thirdPartyIdentifier, then subReservationID
+  const lookups = [
+    { reservation_id: bookingRef },
+    { third_party_identifier: bookingRef },
+  ];
 
-  if (!res.ok) {
-    const errorText = await res.text();
-    console.error("[Cloudbeds] Request failed:", res.status, errorText);
-    throw new Error("Cloudbeds request failed");
+  // If it looks like a sub-reservation (contains "-"), also try the parent
+  if (bookingRef.includes("-")) {
+    lookups.push({ reservation_id: bookingRef.split("-")[0], sub_reservation_id: bookingRef });
   }
 
-  const data = await res.json();
+  for (const body of lookups) {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/cloudbeds/reservation`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
 
-  if (!data?.success) {
-    console.error("[Cloudbeds] Invalid response:", data);
-    throw new Error("Invalid Cloudbeds response");
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (data?.success) {
+        console.log("[Cloudbeds] Found via", Object.keys(body)[0], ":", {
+          roomName: data.roomName,
+          accessCode: data.accessCode,
+        });
+        return data;
+      }
+    } catch (e) {
+      console.warn("[Cloudbeds] Lookup failed for", body, e.message);
+    }
   }
 
-  console.log("[Cloudbeds] Success:", {
-    roomName: data.roomName,
-    accessCode: data.accessCode,
-    checkedIn: data.checkedIn ?? data.isCheckedIn ?? data.guestIsCheckedIn,
-  });
-
-  return data;
+  throw new Error("Reservation not found in Cloudbeds");
 }
 
 function setCors(res) {
