@@ -1,4 +1,4 @@
-// pages/api/verify.js
+//updated/// pages/api/verify.js
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
@@ -517,10 +517,37 @@ export default async function handler(req, res) {
 
       const flowType = normalizeFlowType(sess.flow_type); // default guest
 
-      // ✅ For VISITOR flow, skip Cloudbeds entirely
-      if (flowType === "visitor") {
-        return safeJson(res, 400, { error: "Guest check-in not applicable for visitor flow" });
-      }
+    // ✅ For VISITOR flow, skip Cloudbeds entirely
+if (flowType === "visitor") {
+  const { error: updateErr } = await supabase
+    .from("demo_sessions")
+    .update({
+      guest_name,
+      room_number: "VISITOR",
+      flow_type: "visitor",
+      visitor_first_name: req.body.visitor_first_name || null,
+      visitor_last_name: req.body.visitor_last_name || null,
+      visitor_phone: req.body.visitor_phone || null,
+      visitor_reason: req.body.visitor_reason || null,
+      status: "guest_verified",
+      current_step: "document",
+      updated_at: new Date().toISOString(),
+    })
+    .eq("session_token", session_token);
+
+  if (updateErr) {
+    console.error("[verify.js] Error updating visitor info:", updateErr);
+    return safeJson(res, 500, { error: "Failed to save visitor info" });
+  }
+
+  return safeJson(res, 200, {
+    success: true,
+    guest_name,
+    room_number: "VISITOR",
+    flow_type: "visitor",
+  });
+}
+
 
       // ✅ Only run Cloudbeds checks for GUEST flow
       try {
