@@ -1,4 +1,4 @@
-//updated tues 1017/// pages/api/verify.js
+//updated 1028/// pages/api/verify.js
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
@@ -172,7 +172,12 @@ function safeJson(res, status, payload) {
 function namesMatch(name1, name2) {
   if (!name1 || !name2) return false;
   
-  const normalize = (s) => s.trim().toLowerCase().replace(/,/g, ' ').replace(/\s+/g, ' ');
+  // Normalize: lowercase, remove commas/periods, collapse whitespace
+  const normalize = (s) => s.trim().toLowerCase()
+    .replace(/[,.\-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  
   const n1 = normalize(name1);
   const n2 = normalize(name2);
   
@@ -184,12 +189,8 @@ function namesMatch(name1, name2) {
   const shorter = parts1.length <= parts2.length ? parts1 : parts2;
   const longer = parts1.length <= parts2.length ? parts2 : parts1;
   
-  // Every part of the shorter name must exist exactly in the longer name
   const matchCount = shorter.filter(sp => longer.includes(sp)).length;
-  
-  // If both have 2+ parts, require at least 2 matches
-  // If one has only 1 part, require that 1 part to match
-  const minRequired = shorter.length >= 2 ? 2 : 1;
+  const minRequired = shorter.length === 1 ? 1 : 2;
   
   return matchCount >= minRequired;
 }
@@ -599,6 +600,8 @@ export default async function handler(req, res) {
         // ✅ NAME VALIDATION: Compare input name with Cloudbeds reservation name
         const inputName = (guest_name || "").trim();
         const cbName = (cloudbeds.guestName || "").trim();
+        
+        console.log("[verify.js] Name comparison - Input:", JSON.stringify(inputName), "Cloudbeds:", JSON.stringify(cbName));
         
         if (!namesMatch(inputName, cbName)) {
           console.log("[verify.js] Name mismatch - Input:", inputName, "Cloudbeds:", cbName);
