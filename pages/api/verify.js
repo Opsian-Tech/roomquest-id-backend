@@ -1,4 +1,4 @@
-//updated 1006 tues /// pages/api/verify.js
+//updated tues 1017/// pages/api/verify.js
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
@@ -172,24 +172,26 @@ function safeJson(res, status, payload) {
 function namesMatch(name1, name2) {
   if (!name1 || !name2) return false;
   
-  const n1 = name1.trim().toLowerCase();
-  const n2 = name2.trim().toLowerCase();
+  const normalize = (s) => s.trim().toLowerCase().replace(/,/g, ' ').replace(/\s+/g, ' ');
+  const n1 = normalize(name1);
+  const n2 = normalize(name2);
   
-  // Exact match
   if (n1 === n2) return true;
   
-  // Split into parts and require at least 2 matching parts (first + last),
-  // or all parts of the shorter name must match exactly
-  const parts1 = n1.split(/\s+/).filter(p => p.length > 1);
-  const parts2 = n2.split(/\s+/).filter(p => p.length > 1);
+  const parts1 = n1.split(' ').filter(p => p.length > 1);
+  const parts2 = n2.split(' ').filter(p => p.length > 1);
   
   const shorter = parts1.length <= parts2.length ? parts1 : parts2;
   const longer = parts1.length <= parts2.length ? parts2 : parts1;
   
   // Every part of the shorter name must exist exactly in the longer name
-  const allMatch = shorter.every(sp => longer.includes(sp));
+  const matchCount = shorter.filter(sp => longer.includes(sp)).length;
   
-  return allMatch && shorter.length >= 2;
+  // If both have 2+ parts, require at least 2 matches
+  // If one has only 1 part, require that 1 part to match
+  const minRequired = shorter.length >= 2 ? 2 : 1;
+  
+  return matchCount >= minRequired;
 }
 
 export default async function handler(req, res) {
