@@ -54,7 +54,7 @@ const textract = new TextractClient({
 async function fetchCloudbedsReservation(bookingRef) {
   console.log("[Cloudbeds] Fetching reservation:", bookingRef);
 
-// Try all possible reservation ID types
+  // Try all possible reservation ID types
   const lookups = [
     { reservation_id: bookingRef },
     { third_party_identifier: bookingRef },
@@ -163,6 +163,38 @@ function clampInt(n, min, max) {
 
 function safeJson(res, status, payload) {
   return res.status(status).json({ ...payload, build_id: BUILD_ID });
+}
+
+/**
+ * Helper to compare names with fuzzy matching
+ * Returns true if names match closely enough
+ */
+function namesMatch(name1, name2) {
+  if (!name1 || !name2) return false;
+  
+  const n1 = name1.trim().toLowerCase();
+  const n2 = name2.trim().toLowerCase();
+  
+  // Exact match
+  if (n1 === n2) return true;
+  
+  // One contains the other (handles "John Smith" vs "John")
+  if (n1.includes(n2) || n2.includes(n1)) return true;
+  
+  // Split into parts and check if any significant parts match
+  const parts1 = n1.split(/\s+/).filter(p => p.length > 1);
+  const parts2 = n2.split(/\s+/).filter(p => p.length > 1);
+  
+  // Check if at least one part matches (first or last name)
+  for (const p1 of parts1) {
+    for (const p2 of parts2) {
+      if (p1 === p2 || p1.includes(p2) || p2.includes(p1)) {
+        return true;
+      }
+    }
+  }
+  
+  return false;
 }
 
 export default async function handler(req, res) {
@@ -512,14 +544,14 @@ export default async function handler(req, res) {
     }
 
     // ============================================
-    // ACTION: update_guest (UPDATED)
+    // ACTION: update_guest (UPDATED WITH NAME VALIDATION)
     // ============================================
     if (action === "update_guest") {
       const { session_token, guest_name, booking_ref, flow_type } = req.body || {};
 
       if (!session_token) return safeJson(res, 400, { error: "Session token required" });
       if (!guest_name) return safeJson(res, 400, { error: "Guest name required" });
-     if (flow_type !== "visitor" && !booking_ref) return safeJson(res, 400, { error: "Booking reference required" });
+      if (flow_type !== "visitor" && !booking_ref) return safeJson(res, 400, { error: "Booking reference required" });
 
       // ✅ Get the session's flow type first
       const { data: sess, error: sessErr } = await supabase
@@ -532,41 +564,55 @@ export default async function handler(req, res) {
 
       const flowType = normalizeFlowType(sess.flow_type); // default guest
 
-    // ✅ For VISITOR flow, skip Cloudbeds entirely
-if (flowType === "visitor") {
-  const { error: updateErr } = await supabase
-    .from("demo_sessions")
-    .update({
-      guest_name,
-      room_number: "VISITOR",
-      flow_type: "visitor",
-      visitor_first_name: req.body.visitor_first_name || null,
-      visitor_last_name: req.body.visitor_last_name || null,
-      visitor_phone: req.body.visitor_phone || null,
-      visitor_reason: req.body.visitor_reason || null,
-      status: "guest_verified",
-      current_step: "document",
-      updated_at: new Date().toISOString(),
-    })
-    .eq("session_token", session_token);
+      // ✅ For VISITOR flow, skip Cloudbeds entirely
+      if (flowType === "visitor") {
+        const { error: updateErr } = await supabase
+          .from("demo_sessions")
+          .update({
+            guest_name,
+            room_number: "VISITOR",
+            flow_type: "visitor",
+            visitor_first_name: req.body.visitor_first_name || null,
+            visitor_last_name: req.body.visitor_last_name || null,
+            visitor_phone: req.body.visitor_phone || null,
+            visitor_reason: req.body.visitor_reason || null,
+            status: "guest_verified",
+            current_step: "document",
+            updated_at: new Date().toISOString(),
+          })
+          .eq("session_token", session_token);
 
-  if (updateErr) {
-    console.error("[verify.js] Error updating visitor info:", updateErr);
-    return safeJson(res, 500, { error: "Failed to save visitor info" });
-  }
+        if (updateErr) {
+          console.error("[verify.js] Error updating visitor info:", updateErr);
+          return safeJson(res, 500, { error: "Failed to save visitor info" });
+        }
 
-  return safeJson(res, 200, {
-    success: true,
-    guest_name,
-    room_number: "VISITOR",
-    flow_type: "visitor",
-  });
-}
-
+        return safeJson(res, 200, {
+          success: true,
+          guest_name,
+          room_number: "VISITOR",
+          flow_type: "visitor",
+        });
+      }
 
       // ✅ Only run Cloudbeds checks for GUEST flow
       try {
         const cloudbeds = await fetchCloudbedsReservation(booking_ref);
+
+        // ✅ NAME VALIDATION: Compare input name with Cloudbeds reservation name
+        const inputName = (guest_name || "").trim();
+        const cbName = (cloudbeds.guestName || "").trim();
+        
+        if (!namesMatch(inputName, cbName)) {
+          console.log("[verify.js] Name mismatch - Input:", inputName, "Cloudbeds:", cbName);
+          return safeJson(res, 400, { 
+            error: "name_mismatch_reservation",
+            details: {
+              provided: inputName,
+              expected: cbName
+            }
+          });
+        }
 
         // ✅ Check reservation check-in status (only if backend provides it)
         const guestIsCheckedIn = getGuestIsCheckedIn(cloudbeds);
@@ -635,7 +681,7 @@ if (flowType === "visitor") {
     }
 
     // ============================================
-    // ACTION: upload_document (UPDATED)
+    // ACTION: upload_document (UPDATED WITH TEXTRACT NAME VALIDATION)
     // ============================================
     if (action === "upload_document") {
       const { session_token, image_data } = req.body || {};
@@ -643,10 +689,10 @@ if (flowType === "visitor") {
       if (!session_token) return safeJson(res, 400, { error: "Session token required" });
       if (!image_data) return safeJson(res, 400, { error: "image_data required" });
 
-      // Get session first (flow type is the key)
+      // Get session first (flow type is the key) - NOW INCLUDING guest_name
       const { data: sess, error: sessErr } = await supabase
         .from("demo_sessions")
-        .select("flow_type, expected_guest_count, verified_guest_count")
+        .select("flow_type, expected_guest_count, verified_guest_count, guest_name")
         .eq("session_token", session_token)
         .single();
 
@@ -665,6 +711,55 @@ if (flowType === "visitor") {
       const guestIndex =
         flowType === "visitor" ? 1 : clampInt(verifiedBefore + 1, 1, expected || 1);
 
+      // ✅ TEXTRACT NAME VALIDATION (GUEST FLOW ONLY)
+      if (flowType === "guest" && sess.guest_name) {
+        try {
+          console.log("[verify.js] Running Textract ID analysis...");
+          
+          const analyzeRes = await textract.send(
+            new AnalyzeIDCommand({
+              DocumentPages: [{ Bytes: imageBuffer }]
+            })
+          );
+
+          const fields = analyzeRes.IdentityDocuments?.[0]?.IdentityDocumentFields || [];
+          
+          // Helper to extract field value
+          const getField = (type) => {
+            const field = fields.find(f => f.Type?.Text === type);
+            return field?.ValueDetection?.Text || "";
+          };
+
+          const docFirstName = getField("FIRST_NAME").trim();
+          const docLastName = getField("LAST_NAME").trim();
+          const docFullName = `${docFirstName} ${docLastName}`.trim();
+
+          console.log("[verify.js] Textract extracted:", { docFirstName, docLastName, docFullName });
+
+          const storedName = (sess.guest_name || "").trim();
+
+          // ✅ NAME VALIDATION: Compare document name with stored guest name
+          if (docFullName && storedName && !namesMatch(docFullName, storedName)) {
+            console.log("[verify.js] Document name mismatch - Document:", docFullName, "Expected:", storedName);
+            return safeJson(res, 400, { 
+              error: "name_mismatch_document",
+              details: {
+                document: docFullName,
+                expected: storedName
+              }
+            });
+          }
+
+          console.log("[verify.js] Document name validation passed");
+
+        } catch (textractErr) {
+          console.error("[verify.js] Textract analysis failed:", textractErr);
+          // Continue without name validation if Textract fails
+          // You can optionally make this a hard failure by returning an error here
+        }
+      }
+
+      // Continue with S3 upload
       const s3Key = `demo/${session_token}/document_${guestIndex}.jpg`;
 
       await s3.send(
