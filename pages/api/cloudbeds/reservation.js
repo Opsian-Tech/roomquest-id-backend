@@ -1,5 +1,4 @@
 // pages/api/cloudbeds/reservation.js
-
 const CLOUDBED_API_KEY = process.env.CLOUDBEDS_API_KEY;
 const CLOUDBEDS_PROPERTY_ID = process.env.CLOUDBEDS_PROPERTY_EXTERNAL_ID;
 const CLOUDBEDS_API_BASE = "https://hotels.cloudbeds.com/api/v1.2";
@@ -24,9 +23,25 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Missing CLOUDBED_API_KEY" });
     }
 
-    const { reservation_id, third_party_identifier, sub_reservation_id } = req.body || {};
+    const {
+      reservation_id,
+      third_party_identifier,
+      source_reservation_id,
+      channel_reservation_id,
+      third_party_reservation_id,
+      ota_reservation_id,
+      sub_reservation_id,
+    } = req.body || {};
 
-    if (!reservation_id && !third_party_identifier && !sub_reservation_id) {
+    if (
+      !reservation_id &&
+      !third_party_identifier &&
+      !source_reservation_id &&
+      !channel_reservation_id &&
+      !third_party_reservation_id &&
+      !ota_reservation_id &&
+      !sub_reservation_id
+    ) {
       return res.status(400).json({ error: "Missing reservation identifier" });
     }
 
@@ -36,20 +51,44 @@ export default async function handler(req, res) {
     };
 
     let url;
+    let lookupType;
 
-    if (third_party_identifier) {
-      // thirdPartyIdentifier requires getReservations (plural)
-      url = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${CLOUDBEDS_PROPERTY_ID}&thirdPartyIdentifier=${third_party_identifier}`;
-    } else if (sub_reservation_id) {
+    if (sub_reservation_id) {
       const mainId = sub_reservation_id.split("-")[0];
       url = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${mainId}`;
-    } else {
+      lookupType = "sub_reservation_id";
+    } else if (reservation_id) {
       url = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${reservation_id}`;
+      lookupType = "reservation_id";
+    } else if (
+      source_reservation_id ||
+      third_party_identifier ||
+      channel_reservation_id ||
+      third_party_reservation_id ||
+      ota_reservation_id
+    ) {
+      // All OTA/third-party lookups use thirdPartyIdentifier parameter
+      // Priority order: source_reservation_id > third_party_identifier > others
+      const identifier =
+        source_reservation_id ||
+        third_party_identifier ||
+        channel_reservation_id ||
+        third_party_reservation_id ||
+        ota_reservation_id;
+
+      url = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${CLOUDBEDS_PROPERTY_ID}&thirdPartyIdentifier=${identifier}`;
+
+      if (source_reservation_id) lookupType = "source_reservation_id";
+      else if (third_party_identifier) lookupType = "third_party_identifier";
+      else if (channel_reservation_id) lookupType = "channel_reservation_id";
+      else if (third_party_reservation_id) lookupType = "third_party_reservation_id";
+      else lookupType = "ota_reservation_id";
     }
 
-    console.log("[Cloudbeds] Fetching:", url);
+    console.log(`[Cloudbeds] Fetching via ${lookupType}:`, url);
 
     const cbRes = await fetch(url, { headers });
+
     if (!cbRes.ok) {
       const errText = await cbRes.text();
       console.error("[Cloudbeds] API error:", cbRes.status, errText);
@@ -57,6 +96,7 @@ export default async function handler(req, res) {
     }
 
     const cbData = await cbRes.json();
+
     if (!cbData.success || !cbData.data) {
       throw new Error("Reservation not found");
     }
@@ -100,9 +140,8 @@ export default async function handler(req, res) {
       status: reservation.status || null,
     };
 
-    console.log("[Cloudbeds] Success:", result);
+    console.log(`[Cloudbeds] Success via ${lookupType}:`, result);
     return res.status(200).json(result);
-
   } catch (e) {
     console.error("[Cloudbeds] Error:", e);
     return res.status(500).json({
