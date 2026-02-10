@@ -54,17 +54,24 @@ const textract = new TextractClient({
 async function fetchCloudbedsReservation(bookingRef) {
   console.log("[Cloudbeds] Fetching reservation:", bookingRef);
 
-  // Try reservationID first, then thirdPartyIdentifier, then subReservationID
+// Try all possible reservation ID types
   const lookups = [
     { reservation_id: bookingRef },
     { third_party_identifier: bookingRef },
+    { source_reservation_id: bookingRef },
+    { channel_reservation_id: bookingRef },
+    { third_party_reservation_id: bookingRef },
+    { ota_reservation_id: bookingRef },
   ];
 
   // If it looks like a sub-reservation (contains "-"), also try the parent
   if (bookingRef.includes("-")) {
-    lookups.push({ reservation_id: bookingRef.split("-")[0], sub_reservation_id: bookingRef });
+    lookups.push({ 
+      reservation_id: bookingRef.split("-")[0], 
+      sub_reservation_id: bookingRef 
+    });
   }
-
+  
   for (const body of lookups) {
     try {
       const res = await fetch(`${BACKEND_URL}/api/cloudbeds/reservation`, {
