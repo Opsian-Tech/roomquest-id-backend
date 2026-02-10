@@ -1,4 +1,4 @@
-// pages/api/cloudbeds/reservation.js
+//246// pages/api/cloudbeds/reservation.js
 const CLOUDBED_API_KEY = process.env.CLOUDBEDS_API_KEY;
 const CLOUDBEDS_PROPERTY_ID = process.env.CLOUDBEDS_PROPERTY_EXTERNAL_ID;
 const CLOUDBEDS_API_BASE = "https://hotels.cloudbeds.com/api/v1.2";
