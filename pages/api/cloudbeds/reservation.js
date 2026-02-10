@@ -105,7 +105,30 @@ export default async function handler(req, res) {
     let reservation = cbData.data;
     if (Array.isArray(reservation)) {
       if (reservation.length === 0) throw new Error("Reservation not found");
-      reservation = reservation[0];
+      
+      // If we searched by OTA identifier, validate we got the right reservation
+      // Cloudbeds API sometimes returns wrong reservations with similar numbers
+      if (lookupType.includes("reservation_id") && lookupType !== "reservation_id" && lookupType !== "sub_reservation_id") {
+        const searchedId = source_reservation_id || third_party_identifier || channel_reservation_id || third_party_reservation_id || ota_reservation_id;
+        
+        // Check if any reservation in the results has matching thirdPartyIdentifier
+        const exactMatch = reservation.find(r => {
+          // Check various possible fields where the OTA number might be stored
+          return r.thirdPartyIdentifier === searchedId || 
+                 r.sourceReservationID === searchedId ||
+                 r.source_reservation_id === searchedId;
+        });
+        
+        if (exactMatch) {
+          reservation = exactMatch;
+          console.log(`[Cloudbeds] Exact match found for ${searchedId}`);
+        } else {
+          console.warn(`[Cloudbeds] WARNING: Searched for ${searchedId} but got reservation with different ID. This may be a Cloudbeds API bug.`);
+          reservation = reservation[0]; // Use first result but log warning
+        }
+      } else {
+        reservation = reservation[0];
+      }
     }
 
     // If sub_reservation_id was used, find the matching sub-reservation
