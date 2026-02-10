@@ -1,4 +1,4 @@
-//updated 1028/// pages/api/verify.js
+//updated 1252 Weds/// pages/api/verify.js
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
@@ -84,6 +84,7 @@ async function fetchCloudbedsReservation(bookingRef) {
       const data = await res.json();
       if (data?.success) {
         console.log("[Cloudbeds] Found via", Object.keys(body)[0], ":", {
+          guestName: data.guestName,
           roomName: data.roomName,
           accessCode: data.accessCode,
         });
@@ -181,16 +182,26 @@ function namesMatch(name1, name2) {
   const n1 = normalize(name1);
   const n2 = normalize(name2);
   
-  if (n1 === n2) return true;
+  console.log("[namesMatch] Raw inputs:", { name1, name2 });
+  console.log("[namesMatch] Normalized:", { n1, n2 });
+  
+  if (n1 === n2) {
+    console.log("[namesMatch] Exact match found");
+    return true;
+  }
   
   const parts1 = n1.split(' ').filter(p => p.length > 1);
   const parts2 = n2.split(' ').filter(p => p.length > 1);
+  
+  console.log("[namesMatch] Parts:", { parts1, parts2 });
   
   const shorter = parts1.length <= parts2.length ? parts1 : parts2;
   const longer = parts1.length <= parts2.length ? parts2 : parts1;
   
   const matchCount = shorter.filter(sp => longer.includes(sp)).length;
   const minRequired = shorter.length === 1 ? 1 : 2;
+  
+  console.log("[namesMatch] Match analysis:", { matchCount, minRequired, result: matchCount >= minRequired });
   
   return matchCount >= minRequired;
 }
@@ -604,6 +615,51 @@ export default async function handler(req, res) {
         console.log("[verify.js] Name comparison - Input:", JSON.stringify(inputName), "Cloudbeds:", JSON.stringify(cbName));
         
         if (!namesMatch(inputName, cbName)) {
+          // ✅ FALLBACK: If this was an OTA lookup and we have a Cloudbeds reservation ID, try that
+          if (cloudbeds.reservationId && cloudbeds.reservationId !== booking_ref) {
+            console.log("[verify.js] Name mismatch with OTA lookup, trying Cloudbeds reservation ID:", cloudbeds.reservationId);
+            
+            try {
+              const cloudbedsSecondary = await fetchCloudbedsReservation(cloudbeds.reservationId);
+              const cbNameSecondary = (cloudbedsSecondary.guestName || "").trim();
+              
+              console.log("[verify.js] Secondary lookup name:", JSON.stringify(cbNameSecondary));
+              
+              if (namesMatch(inputName, cbNameSecondary)) {
+                console.log("[verify.js] Name matched with Cloudbeds reservation ID lookup");
+                // Use the secondary lookup data
+                const { error: updateErr } = await supabase
+                  .from("demo_sessions")
+                  .update({
+                    guest_name,
+                    room_number: booking_ref,
+                    cloudbeds_reservation_id: cloudbeds.reservationId,
+                    physical_room: cloudbedsSecondary.roomName,
+                    room_access_code: cloudbedsSecondary.accessCode,
+                    status: "guest_verified",
+                    current_step: "document",
+                    updated_at: new Date().toISOString(),
+                  })
+                  .eq("session_token", session_token);
+
+                if (updateErr) {
+                  console.error("[verify.js] Error updating guest info:", updateErr);
+                  return safeJson(res, 500, { error: "Failed to save guest info" });
+                }
+
+                return safeJson(res, 200, {
+                  success: true,
+                  guest_name: cloudbedsSecondary.guestName,
+                  room_number: cloudbedsSecondary.roomName,
+                  reservation_id: cloudbeds.reservationId,
+                  access_code: cloudbedsSecondary.accessCode,
+                });
+              }
+            } catch (secondaryErr) {
+              console.warn("[verify.js] Secondary Cloudbeds lookup failed:", secondaryErr);
+            }
+          }
+          
           console.log("[verify.js] Name mismatch - Input:", inputName, "Cloudbeds:", cbName);
           return safeJson(res, 400, { 
             error: "name_mismatch_reservation",
