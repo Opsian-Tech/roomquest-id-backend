@@ -1,4 +1,4 @@
-//updated 306 Weds/// pages/api/verify.js
+//updated/// pages/api/verify.js
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
@@ -51,66 +51,28 @@ const textract = new TextractClient({
   },
 });
 
-async function fetchCloudbedsReservation(bookingRef, guestName = null) {
-  console.log("[Cloudbeds] Fetching reservation:", bookingRef, "Guest:", guestName);
+async function fetchCloudbedsReservation(bookingRef) {
+  console.log("[Cloudbeds] Fetching reservation:", bookingRef);
 
-  // Strategy 1: Try direct Cloudbeds reservation ID first (most reliable)
-  try {
-    const res = await fetch(`${BACKEND_URL}/api/cloudbeds/reservation`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reservation_id: bookingRef }),
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      if (data?.success) {
-        console.log("[Cloudbeds] Found via reservation_id:", {
-          guestName: data.guestName,
-          roomName: data.roomName,
-          accessCode: data.accessCode,
-        });
-        return data;
-      }
-    }
-  } catch (e) {
-    console.warn("[Cloudbeds] Direct lookup failed:", e.message);
-  }
-
-  // Strategy 2: If guest name provided, search by name (more reliable than OTA IDs)
-  console.log("[Cloudbeds] Strategy 2 check:", { guestName, hasBackendUrl: !!BACKEND_URL });
-  if (guestName && BACKEND_URL) {
-    console.log("[Cloudbeds] Attempting name search...");
-    try {
-      const res = await fetch(`${BACKEND_URL}/api/cloudbeds/search-by-name`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ guest_name: guestName, booking_ref: bookingRef }),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.success) {
-          console.log("[Cloudbeds] Found via name search:", {
-            guestName: data.guestName,
-            roomName: data.roomName,
-            accessCode: data.accessCode,
-          });
-          return data;
-        }
-      }
-    } catch (e) {
-      console.warn("[Cloudbeds] Name search failed:", e.message);
-    }
-  }
-
-  // Strategy 3: Try OTA identifiers as last resort (known to have bugs)
-  const otaLookups = [
+  // Try all possible reservation ID types
+  const lookups = [
+    { reservation_id: bookingRef },
     { third_party_identifier: bookingRef },
     { source_reservation_id: bookingRef },
+    { channel_reservation_id: bookingRef },
+    { third_party_reservation_id: bookingRef },
+    { ota_reservation_id: bookingRef },
   ];
 
-  for (const body of otaLookups) {
+  // If it looks like a sub-reservation (contains "-"), also try the parent
+  if (bookingRef.includes("-")) {
+    lookups.push({ 
+      reservation_id: bookingRef.split("-")[0], 
+      sub_reservation_id: bookingRef 
+    });
+  }
+  
+  for (const body of lookups) {
     try {
       const res = await fetch(`${BACKEND_URL}/api/cloudbeds/reservation`, {
         method: "POST",
@@ -121,28 +83,14 @@ async function fetchCloudbedsReservation(bookingRef, guestName = null) {
       if (!res.ok) continue;
       const data = await res.json();
       if (data?.success) {
-        // ⚠️ Validate name matches if provided (OTA lookups can return wrong reservations)
-        if (guestName && data.guestName) {
-          if (!namesMatch(guestName, data.guestName)) {
-            console.warn("[Cloudbeds] OTA lookup returned wrong guest:", {
-              searched: bookingRef,
-              expectedName: guestName,
-              gotName: data.guestName,
-              gotReservation: data.reservationId
-            });
-            continue; // Skip this result, try next lookup
-          }
-        }
-
         console.log("[Cloudbeds] Found via", Object.keys(body)[0], ":", {
-          guestName: data.guestName,
           roomName: data.roomName,
           accessCode: data.accessCode,
         });
         return data;
       }
     } catch (e) {
-      console.warn("[Cloudbeds] OTA lookup failed for", body, e.message);
+      console.warn("[Cloudbeds] Lookup failed for", body, e.message);
     }
   }
 
@@ -224,37 +172,29 @@ function safeJson(res, status, payload) {
 function namesMatch(name1, name2) {
   if (!name1 || !name2) return false;
   
-  // Normalize: lowercase, remove commas/periods, collapse whitespace
-  const normalize = (s) => s.trim().toLowerCase()
-    .replace(/[,.\-]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const n1 = name1.trim().toLowerCase();
+  const n2 = name2.trim().toLowerCase();
   
-  const n1 = normalize(name1);
-  const n2 = normalize(name2);
+  // Exact match
+  if (n1 === n2) return true;
   
-  console.log("[namesMatch] Raw inputs:", { name1, name2 });
-  console.log("[namesMatch] Normalized:", { n1, n2 });
+  // One contains the other (handles "John Smith" vs "John")
+  if (n1.includes(n2) || n2.includes(n1)) return true;
   
-  if (n1 === n2) {
-    console.log("[namesMatch] Exact match found");
-    return true;
+  // Split into parts and check if any significant parts match
+  const parts1 = n1.split(/\s+/).filter(p => p.length > 1);
+  const parts2 = n2.split(/\s+/).filter(p => p.length > 1);
+  
+  // Check if at least one part matches (first or last name)
+  for (const p1 of parts1) {
+    for (const p2 of parts2) {
+      if (p1 === p2 || p1.includes(p2) || p2.includes(p1)) {
+        return true;
+      }
+    }
   }
   
-  const parts1 = n1.split(' ').filter(p => p.length > 1);
-  const parts2 = n2.split(' ').filter(p => p.length > 1);
-  
-  console.log("[namesMatch] Parts:", { parts1, parts2 });
-  
-  const shorter = parts1.length <= parts2.length ? parts1 : parts2;
-  const longer = parts1.length <= parts2.length ? parts2 : parts1;
-  
-  const matchCount = shorter.filter(sp => longer.includes(sp)).length;
-  const minRequired = shorter.length === 1 ? 1 : 2;
-  
-  console.log("[namesMatch] Match analysis:", { matchCount, minRequired, result: matchCount >= minRequired });
-  
-  return matchCount >= minRequired;
+  return false;
 }
 
 export default async function handler(req, res) {
@@ -477,7 +417,7 @@ export default async function handler(req, res) {
       // ✅ Only run Cloudbeds checks for GUEST flow
       if (guest_verified && flow_type === "guest" && session.room_number && BACKEND_URL) {
         try {
-          const cloudbeds = await fetchCloudbedsReservation(session.room_number, session.guest_name);
+          const cloudbeds = await fetchCloudbedsReservation(session.room_number);
 
           // ✅ Check-in validation (GUEST ONLY) -> only error message here
           const guestIsCheckedIn = getGuestIsCheckedIn(cloudbeds);
@@ -604,7 +544,7 @@ export default async function handler(req, res) {
     }
 
     // ============================================
-    // ACTION: update_guest (UPDATED WITH NAME VALIDATION AND OTA FALLBACK)
+    // ACTION: update_guest (UPDATED WITH NAME VALIDATION)
     // ============================================
     if (action === "update_guest") {
       const { session_token, guest_name, booking_ref, flow_type } = req.body || {};
@@ -657,67 +597,13 @@ export default async function handler(req, res) {
 
       // ✅ Only run Cloudbeds checks for GUEST flow
       try {
-        const cloudbeds = await fetchCloudbedsReservation(booking_ref, guest_name);
+        const cloudbeds = await fetchCloudbedsReservation(booking_ref);
 
         // ✅ NAME VALIDATION: Compare input name with Cloudbeds reservation name
         const inputName = (guest_name || "").trim();
         const cbName = (cloudbeds.guestName || "").trim();
         
-        console.log("[verify.js] Name comparison - Input:", JSON.stringify(inputName), "Cloudbeds:", JSON.stringify(cbName));
-        
         if (!namesMatch(inputName, cbName)) {
-          // ✅ FALLBACK: If this was an OTA lookup and we have a Cloudbeds reservation ID, try that
-          if (cloudbeds.reservationId && cloudbeds.reservationId !== booking_ref) {
-            console.log("[verify.js] Name mismatch with OTA lookup, trying Cloudbeds reservation ID:", cloudbeds.reservationId);
-            
-            try {
-              const cloudbedsSecondary = await fetchCloudbedsReservation(cloudbeds.reservationId, guest_name);
-              const cbNameSecondary = (cloudbedsSecondary.guestName || "").trim();
-              
-              console.log("[verify.js] Secondary lookup name:", JSON.stringify(cbNameSecondary));
-              
-              if (namesMatch(inputName, cbNameSecondary)) {
-                console.log("[verify.js] Name matched with Cloudbeds reservation ID lookup");
-                
-                // ✅ Check reservation check-in status
-                const guestIsCheckedIn = getGuestIsCheckedIn(cloudbedsSecondary);
-                if (!guestIsCheckedIn) {
-                  return safeJson(res, 400, { error: "guest check in required" });
-                }
-                
-                // Use the secondary lookup data
-                const { error: updateErr } = await supabase
-                  .from("demo_sessions")
-                  .update({
-                    guest_name,
-                    room_number: booking_ref,
-                    cloudbeds_reservation_id: cloudbeds.reservationId,
-                    physical_room: cloudbedsSecondary.roomName,
-                    room_access_code: cloudbedsSecondary.accessCode,
-                    status: "guest_verified",
-                    current_step: "document",
-                    updated_at: new Date().toISOString(),
-                  })
-                  .eq("session_token", session_token);
-
-                if (updateErr) {
-                  console.error("[verify.js] Error updating guest info:", updateErr);
-                  return safeJson(res, 500, { error: "Failed to save guest info" });
-                }
-
-                return safeJson(res, 200, {
-                  success: true,
-                  guest_name: cloudbedsSecondary.guestName,
-                  room_number: cloudbedsSecondary.roomName,
-                  reservation_id: cloudbeds.reservationId,
-                  access_code: cloudbedsSecondary.accessCode,
-                });
-              }
-            } catch (secondaryErr) {
-              console.warn("[verify.js] Secondary Cloudbeds lookup failed:", secondaryErr);
-            }
-          }
-          
           console.log("[verify.js] Name mismatch - Input:", inputName, "Cloudbeds:", cbName);
           return safeJson(res, 400, { 
             error: "name_mismatch_reservation",
