@@ -1,4 +1,4 @@
-//updated/// pages/api/verify.js
+//updated 1006 tues /// pages/api/verify.js
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
@@ -178,23 +178,18 @@ function namesMatch(name1, name2) {
   // Exact match
   if (n1 === n2) return true;
   
-  // One contains the other (handles "John Smith" vs "John")
-  if (n1.includes(n2) || n2.includes(n1)) return true;
-  
-  // Split into parts and check if any significant parts match
+  // Split into parts and require at least 2 matching parts (first + last),
+  // or all parts of the shorter name must match exactly
   const parts1 = n1.split(/\s+/).filter(p => p.length > 1);
   const parts2 = n2.split(/\s+/).filter(p => p.length > 1);
   
-  // Check if at least one part matches (first or last name)
-  for (const p1 of parts1) {
-    for (const p2 of parts2) {
-      if (p1 === p2 || p1.includes(p2) || p2.includes(p1)) {
-        return true;
-      }
-    }
-  }
+  const shorter = parts1.length <= parts2.length ? parts1 : parts2;
+  const longer = parts1.length <= parts2.length ? parts2 : parts1;
   
-  return false;
+  // Every part of the shorter name must exist exactly in the longer name
+  const allMatch = shorter.every(sp => longer.includes(sp));
+  
+  return allMatch && shorter.length >= 2;
 }
 
 export default async function handler(req, res) {
