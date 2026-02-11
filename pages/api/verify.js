@@ -1,4 +1,4 @@
-// weds 7pm
+// verify.fixed
 
 
 
@@ -63,25 +63,46 @@ const textract = new TextractClient({
 });
 
 async function fetchCloudbedsReservation(bookingRef) {
-  console.log("[Cloudbeds] Fetching reservation:", bookingRef);
+  const ref = String(bookingRef ?? "").trim();
+  if (!ref) throw new Error("Missing bookingRef");
 
-  const lookups = [
-    { reservation_id: bookingRef },
-    { third_party_identifier: bookingRef },
-    { source_reservation_id: bookingRef },
-    { channel_reservation_id: bookingRef },
-    { third_party_reservation_id: bookingRef },
-    { ota_reservation_id: bookingRef },
-  ];
+  const isPureDigits = /^\d+$/.test(ref);
+  const looksLikeCloudbedsId = !isPureDigits && ref.length >= 6;
 
-  if (String(bookingRef).includes("-")) {
-    lookups.push({
-      reservation_id: String(bookingRef).split("-")[0],
-      sub_reservation_id: bookingRef,
+  console.log("[Cloudbeds] Fetching reservation (multi-lookup):", ref, {
+    looksLikeCloudbedsId,
+    isPureDigits,
+  });
+
+  // IMPORTANT:
+  // - If the user typed a Cloudbeds reservationID (alphanumeric), try reservation_id first.
+  // - If the user typed an OTA/source reservation id (often numeric), try OTA fields first so we don't waste calls.
+  const lookupOrder = looksLikeCloudbedsId
+    ? [
+        { reservation_id: ref },
+        { third_party_identifier: ref },
+        { source_reservation_id: ref },
+        { channel_reservation_id: ref },
+        { third_party_reservation_id: ref },
+        { ota_reservation_id: ref },
+      ]
+    : [
+        { third_party_identifier: ref },
+        { source_reservation_id: ref },
+        { channel_reservation_id: ref },
+        { third_party_reservation_id: ref },
+        { ota_reservation_id: ref },
+        { reservation_id: ref },
+      ];
+
+  if (ref.includes("-")) {
+    lookupOrder.push({
+      reservation_id: ref.split("-")[0],
+      sub_reservation_id: ref,
     });
   }
 
-  for (const body of lookups) {
+  for (const body of lookupOrder) {
     try {
       const res = await fetch(`${BACKEND_URL}/api/cloudbeds/reservation`, {
         method: "POST",
@@ -94,7 +115,7 @@ async function fetchCloudbedsReservation(bookingRef) {
       const data = await res.json();
 
       if (data?.success) {
-        console.log("[Cloudbeds] Found via", Object.keys(body)[0], ":", {
+        console.log("[Cloudbeds] Found via", Object.keys(body).join(","), ":", {
           guestName: data.guestName,
           roomName: data.roomName,
           accessCode: data.accessCode,
@@ -110,6 +131,7 @@ async function fetchCloudbedsReservation(bookingRef) {
 
   throw new Error("Reservation not found in Cloudbeds");
 }
+
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Credentials", "true");
