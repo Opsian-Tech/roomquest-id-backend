@@ -132,11 +132,68 @@ export default async function handler(req, res) {
       roomName = assigned[0].roomName || assigned[0].roomTypeName || null;
     }
 
+    // Extract door code from custom fields - check multiple common field names
     let accessCode = null;
     const customFields = reservation.customFields || [];
-    const doorCodeField = customFields.find((f) => f.customFieldName === "Door Code");
-    if (doorCodeField) {
-      accessCode = doorCodeField.customFieldValue;
+    
+    // Try common door code field names (case-sensitive exact match first)
+    const doorCodeFieldNames = [
+      "DOORCODE",
+      "Door Code",
+      "door code",
+      "Door code",
+      "Access Code",
+      "access code",
+      "Access code",
+      "Room Code",
+      "room code",
+      "Lock Code",
+      "lock code",
+      "Key Code",
+      "key code",
+      "Room Key Passcode",
+      "room key passcode",
+      "Room key passcode",
+      "Passcode",
+      "passcode",
+    ];
+    
+    for (const fieldName of doorCodeFieldNames) {
+      const field = customFields.find((f) => f && String(f.customFieldName || "").trim() === fieldName);
+      if (field && field.customFieldValue != null && String(field.customFieldValue).trim() !== "") {
+        accessCode = String(field.customFieldValue).trim();
+        break;
+      }
+    }
+    
+    // Fallback: case-insensitive search for any field containing "door", "code", "access", "key", "lock", or "passcode"
+    if (!accessCode && customFields.length > 0) {
+      const lowerNames = ["door", "code", "access", "key", "lock", "passcode"];
+      const fallback = customFields.find((f) => {
+        if (!f || !f.customFieldName || !f.customFieldValue) return false;
+        const value = String(f.customFieldValue).trim();
+        if (value === "") return false;
+        const name = String(f.customFieldName).toLowerCase();
+        return lowerNames.some((k) => name.includes(k));
+      });
+      if (fallback) {
+        accessCode = String(fallback.customFieldValue).trim();
+      }
+    }
+    
+    // Log available custom field names if no door code found (for debugging)
+    if (!accessCode && customFields.length > 0) {
+      const fieldNames = customFields.map((f) => f?.customFieldName).filter(Boolean);
+      const fieldDetails = customFields.map((f) => ({
+        name: f?.customFieldName,
+        value: f?.customFieldValue ? String(f.customFieldValue).substring(0, 20) + "..." : null
+      }));
+      console.warn("[Cloudbeds Search] No door code found. Available custom fields:", fieldNames.join(", "));
+      console.warn("[Cloudbeds Search] Custom field details:", JSON.stringify(fieldDetails, null, 2));
+    } else if (!accessCode) {
+      console.warn("[Cloudbeds Search] No custom fields found on reservation");
+    } else {
+      console.log("[Cloudbeds Search] Door code found:", accessCode);
     }
 
     const result = {
