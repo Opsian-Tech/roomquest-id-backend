@@ -3,6 +3,9 @@ const CLOUDBED_API_KEY = process.env.CLOUDBEDS_API_KEY;
 const CLOUDBEDS_PROPERTY_ID = process.env.CLOUDBEDS_PROPERTY_EXTERNAL_ID;
 const CLOUDBEDS_API_BASE = "https://hotels.cloudbeds.com/api/v1.2";
 
+// change this string each deploy to prove you’re hitting the new code
+const BUILD_ID = "reservation-api-ota-debug-v3";
+
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -27,9 +30,7 @@ async function fetchCloudbedsAPI(url, headers) {
   let cbData = {};
   try {
     cbData = text ? JSON.parse(text) : {};
-  } catch {
-    // ignore parse fail
-  }
+  } catch {}
 
   if (!cbRes.ok) {
     console.error("[Cloudbeds] API error:", cbRes.status, text);
@@ -178,11 +179,11 @@ export default async function handler(req, res) {
   setCors(res);
 
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ success: false, error: "Method not allowed" });
+  if (req.method !== "POST") return res.status(405).json({ success: false, error: "Method not allowed", build_id: BUILD_ID });
 
   try {
-    if (!CLOUDBED_API_KEY) return res.status(500).json({ success: false, error: "Missing CLOUDBEDS_API_KEY" });
-    if (!CLOUDBEDS_PROPERTY_ID) return res.status(500).json({ success: false, error: "Missing CLOUDBEDS_PROPERTY_EXTERNAL_ID" });
+    if (!CLOUDBED_API_KEY) return res.status(500).json({ success: false, error: "Missing CLOUDBEDS_API_KEY", build_id: BUILD_ID });
+    if (!CLOUDBEDS_PROPERTY_ID) return res.status(500).json({ success: false, error: "Missing CLOUDBEDS_PROPERTY_EXTERNAL_ID", build_id: BUILD_ID });
 
     const {
       reservation_id,
@@ -208,26 +209,26 @@ export default async function handler(req, res) {
 
     let rid = null;
 
-    // ---- ALWAYS RESOLVE RID FIRST ----
     if (otaIdentifier) {
       rid = await resolveRidFromOta(String(otaIdentifier), headers);
       if (!rid) {
-        return res.status(404).json({ success: false, error: "Could not resolve Cloudbeds reservationID from OTA identifier" });
+        return res.status(404).json({ success: false, error: "Could not resolve Cloudbeds reservationID from OTA identifier", build_id: BUILD_ID });
       }
     } else if (sub_reservation_id) {
       rid = String(sub_reservation_id).split("-")[0];
     } else if (reservation_id) {
       rid = String(reservation_id);
     } else {
-      return res.status(400).json({ success: false, error: "Missing reservation identifier" });
+      return res.status(400).json({ success: false, error: "Missing reservation identifier", build_id: BUILD_ID });
     }
 
-    // ---- ALWAYS FETCH FULL RESERVATION USING RID ----
-    const fullUrl = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${encodeURIComponent(CLOUDBEDS_PROPERTY_ID)}&reservationID=${encodeURIComponent(String(rid))}`;
+    const fullUrl =
+      `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${encodeURIComponent(CLOUDBEDS_PROPERTY_ID)}&reservationID=${encodeURIComponent(String(rid))}`;
+
     const fullData = await fetchCloudbedsAPI(fullUrl, headers);
     const fullReservation = fullData?.data;
 
-    if (!fullReservation) return res.status(404).json({ success: false, error: "Reservation not found" });
+    if (!fullReservation) return res.status(404).json({ success: false, error: "Reservation not found", build_id: BUILD_ID });
 
     const roomName =
       extractRoomName(fullReservation, sub_reservation_id) ||
@@ -236,11 +237,26 @@ export default async function handler(req, res) {
       null;
 
     const accessCode = extractDoorCode(fullReservation, sub_reservation_id);
-
     const status = fullReservation?.status || null;
+
+    // Debug snapshot to prove what getReservation returned
+    const debug = {
+      rid_used: String(rid),
+      got_reservationID: fullReservation?.reservationID || fullReservation?.reservationId || null,
+      top_accessCode: fullReservation?.accessCode || fullReservation?.access_code || null,
+      assigned_count: Array.isArray(fullReservation?.assigned) ? fullReservation.assigned.length : 0,
+      assigned0_roomName: fullReservation?.assigned?.[0]?.roomName || fullReservation?.assigned?.[0]?.roomNumber || null,
+      assigned0_accessCode:
+        fullReservation?.assigned?.[0]?.accessCode ||
+        fullReservation?.assigned?.[0]?.access_code ||
+        fullReservation?.assigned?.[0]?.doorCode ||
+        fullReservation?.assigned?.[0]?.door_code ||
+        null,
+    };
 
     return res.status(200).json({
       success: true,
+      build_id: BUILD_ID,
       reservationId: fullReservation?.reservationID || fullReservation?.reservationId || rid,
       roomName,
       accessCode,
@@ -250,9 +266,10 @@ export default async function handler(req, res) {
       status,
       otaIdentifier: otaIdentifier ? String(otaIdentifier) : null,
       guestIsCheckedIn: isCheckedInStatus(status),
+      debug,
     });
   } catch (e) {
     console.error("[Cloudbeds] ERROR:", e?.message || e);
-    return res.status(500).json({ success: false, error: e?.message || "Server error" });
+    return res.status(500).json({ success: false, error: e?.message || "Server error", build_id: BUILD_ID });
   }
 }
