@@ -609,6 +609,14 @@ export default async function handler(req, res) {
       // ✅ Only run Cloudbeds checks for GUEST flow
       try {
         const cloudbeds = await fetchCloudbedsReservation(booking_ref);
+        
+        console.log("[verify.js] Cloudbeds response:", {
+          reservationId: cloudbeds.reservationId,
+          guestName: cloudbeds.guestName,
+          roomName: cloudbeds.roomName,
+          accessCode: cloudbeds.accessCode,
+          otaIdentifier: cloudbeds.otaIdentifier
+        });
 
         // ✅ NAME VALIDATION: Compare input name with Cloudbeds reservation name
         const inputName = (guest_name || "").trim();
@@ -625,6 +633,12 @@ export default async function handler(req, res) {
               const cloudbedsSecondary = await fetchCloudbedsReservation(cloudbeds.reservationId);
               const cbNameSecondary = (cloudbedsSecondary.guestName || "").trim();
               
+              console.log("[verify.js] Secondary lookup result:", {
+                reservationId: cloudbedsSecondary.reservationId,
+                guestName: cloudbedsSecondary.guestName,
+                roomName: cloudbedsSecondary.roomName,
+                accessCode: cloudbedsSecondary.accessCode
+              });
               console.log("[verify.js] Secondary lookup name:", JSON.stringify(cbNameSecondary));
               
               if (namesMatch(inputName, cbNameSecondary)) {
@@ -678,6 +692,14 @@ export default async function handler(req, res) {
         if (!guestIsCheckedIn) {
           return safeJson(res, 400, { error: "guest check in required" });
         }
+
+        // 🔍 DEBUG: Log what we're about to store
+        console.log("[verify.js] About to store in database:", {
+          cloudbeds_reservation_id: cloudbeds.reservationId,
+          physical_room: cloudbeds.roomName,
+          room_access_code: cloudbeds.accessCode,
+          has_access_code: !!cloudbeds.accessCode
+        });
 
         const { error: updateErr } = await supabase
           .from("demo_sessions")
