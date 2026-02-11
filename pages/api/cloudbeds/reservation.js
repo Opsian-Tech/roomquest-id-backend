@@ -122,11 +122,54 @@ export default async function handler(req, res) {
       roomName = assigned[0].roomName || assigned[0].roomTypeName || null;
     }
 
+    // Extract door code from custom fields - check multiple common field names
     let accessCode = null;
     const customFields = reservation.customFields || [];
-    const doorCodeField = customFields.find((f) => f.customFieldName === "DOORCODE");
-    if (doorCodeField) {
-      accessCode = doorCodeField.customFieldValue;
+    
+    // Try common door code field names (case-sensitive exact match first)
+    const doorCodeFieldNames = [
+      "DOORCODE",
+      "Door Code",
+      "door code",
+      "Door code",
+      "Access Code",
+      "access code",
+      "Access code",
+      "Room Code",
+      "room code",
+      "Lock Code",
+      "lock code",
+      "Key Code",
+      "key code",
+    ];
+    
+    for (const fieldName of doorCodeFieldNames) {
+      const field = customFields.find((f) => f && String(f.customFieldName || "").trim() === fieldName);
+      if (field && field.customFieldValue != null && String(field.customFieldValue).trim() !== "") {
+        accessCode = String(field.customFieldValue).trim();
+        break;
+      }
+    }
+    
+    // Fallback: case-insensitive search for any field containing "door", "code", "access", "key", or "lock"
+    if (!accessCode && customFields.length > 0) {
+      const lowerNames = ["door", "code", "access", "key", "lock"];
+      const fallback = customFields.find((f) => {
+        if (!f || !f.customFieldName || !f.customFieldValue) return false;
+        const value = String(f.customFieldValue).trim();
+        if (value === "") return false;
+        const name = String(f.customFieldName).toLowerCase();
+        return lowerNames.some((k) => name.includes(k));
+      });
+      if (fallback) {
+        accessCode = String(fallback.customFieldValue).trim();
+      }
+    }
+    
+    // Log available custom field names if no door code found (for debugging)
+    if (!accessCode && customFields.length > 0) {
+      const fieldNames = customFields.map((f) => f?.customFieldName).filter(Boolean);
+      console.warn("[Cloudbeds] No door code found. Available custom fields:", fieldNames.join(", "));
     }
 
     const result = {
