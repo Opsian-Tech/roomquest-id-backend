@@ -3,8 +3,8 @@ const CLOUDBED_API_KEY = process.env.CLOUDBEDS_API_KEY;
 const CLOUDBEDS_PROPERTY_ID = process.env.CLOUDBEDS_PROPERTY_EXTERNAL_ID;
 const CLOUDBEDS_API_BASE = "https://hotels.cloudbeds.com/api/v1.2";
 
-// change this string each deploy to prove you’re hitting the new code
-const BUILD_ID = "reservation-api-ota-debug-v3";
+// ✅ change this string each deploy to prove you’re hitting the new code
+const BUILD_ID = "reservation-ota-fix-v1";
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Credentials", "true");
@@ -239,7 +239,6 @@ export default async function handler(req, res) {
     const accessCode = extractDoorCode(fullReservation, sub_reservation_id);
     const status = fullReservation?.status || null;
 
-    // Debug snapshot to prove what getReservation returned
     const debug = {
       rid_used: String(rid),
       got_reservationID: fullReservation?.reservationID || fullReservation?.reservationId || null,
@@ -254,6 +253,7 @@ export default async function handler(req, res) {
         null,
     };
 
+    // ✅ INCLUDE build_id in success response
     return res.status(200).json({
       success: true,
       build_id: BUILD_ID,
