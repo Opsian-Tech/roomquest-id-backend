@@ -1,5 +1,3 @@
-// OTA - 
-
 //updated/// pages/api/verify.js
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
