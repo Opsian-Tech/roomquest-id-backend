@@ -1,4 +1,8 @@
-//updated verify.js - Fixed OTA door code retrieval
+// verify.js - UPDATED (Fixes: OTA overwrite-to-null + get_session key mismatch)
+// - Prevents verify_face from overwriting valid physical_room/room_access_code with null if Cloudbeds lookup fails
+// - Prefers cloudbeds_reservation_id for lookup when available (works for OTA thirdPartyIdentifier flows)
+// - get_session now returns BOTH snake_case and camelCase room access code keys for frontend compatibility
+
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
@@ -20,7 +24,7 @@ const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 /**
  * BUILD MARKER
  */
-const BUILD_ID = "cloudbeds-integration-v1-ota-fixed";
+const BUILD_ID = "cloudbeds-integration-v1-ota-fixed-v2";
 
 if (!SUPABASE_URL) console.warn("Missing env: NEXT_PUBLIC_SUPABASE_URL");
 if (!SUPABASE_SERVICE_KEY) console.warn("Missing env: SUPABASE_SERVICE_KEY");
@@ -29,6 +33,7 @@ if (!BUCKET) console.warn("Missing env: S3_BUCKET_NAME");
 if (!BACKEND_URL) console.warn("Missing env: NEXT_PUBLIC_BACKEND_URL");
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
 const s3 = new S3Client({
   region: AWS_REGION,
   credentials: {
@@ -36,6 +41,7 @@ const s3 = new S3Client({
     secretAccessKey: AWS_SECRET_ACCESS_KEY,
   },
 });
+
 const rekognition = new RekognitionClient({
   region: AWS_REGION,
   credentials: {
@@ -43,6 +49,7 @@ const rekognition = new RekognitionClient({
     secretAccessKey: AWS_SECRET_ACCESS_KEY,
   },
 });
+
 const textract = new TextractClient({
   region: AWS_REGION,
   credentials: {
@@ -54,7 +61,6 @@ const textract = new TextractClient({
 async function fetchCloudbedsReservation(bookingRef) {
   console.log("[Cloudbeds] Fetching reservation:", bookingRef);
 
-  // Try all possible reservation ID types
   const lookups = [
     { reservation_id: bookingRef },
     { third_party_identifier: bookingRef },
@@ -64,14 +70,13 @@ async function fetchCloudbedsReservation(bookingRef) {
     { ota_reservation_id: bookingRef },
   ];
 
-  // If it looks like a sub-reservation (contains "-"), also try the parent
-  if (bookingRef.includes("-")) {
-    lookups.push({ 
-      reservation_id: bookingRef.split("-")[0], 
-      sub_reservation_id: bookingRef 
+  if (String(bookingRef).includes("-")) {
+    lookups.push({
+      reservation_id: String(bookingRef).split("-")[0],
+      sub_reservation_id: bookingRef,
     });
   }
-  
+
   for (const body of lookups) {
     try {
       const res = await fetch(`${BACKEND_URL}/api/cloudbeds/reservation`, {
@@ -81,7 +86,9 @@ async function fetchCloudbedsReservation(bookingRef) {
       });
 
       if (!res.ok) continue;
+
       const data = await res.json();
+
       if (data?.success) {
         console.log("[Cloudbeds] Found via", Object.keys(body)[0], ":", {
           guestName: data.guestName,
@@ -93,7 +100,7 @@ async function fetchCloudbedsReservation(bookingRef) {
         return data;
       }
     } catch (e) {
-      console.warn("[Cloudbeds] Lookup failed for", body, e.message);
+      console.warn("[Cloudbeds] Lookup failed for", body, e?.message || e);
     }
   }
 
@@ -115,12 +122,10 @@ function generateToken() {
 }
 
 function generateSixDigitCode() {
-  // 000000 - 999999
   return String(crypto.randomInt(0, 1_000_000)).padStart(6, "0");
 }
 
 function getGuestIsCheckedIn(cloudbeds) {
-  // Backward compatible: if backend doesn't provide a checked-in signal, assume OK.
   const v =
     cloudbeds?.guestIsCheckedIn ??
     cloudbeds?.isCheckedIn ??
@@ -137,7 +142,7 @@ function getGuestIsCheckedIn(cloudbeds) {
     if (["false", "no", "n", "notcheckedin", "not_checked_in", "not-checked-in", "0"].includes(s))
       return false;
   }
-  return true;
+  return true; // backward-compatible default
 }
 
 async function streamToBuffer(readable) {
@@ -170,41 +175,42 @@ function safeJson(res, status, payload) {
 
 /**
  * Helper to compare names with fuzzy matching
- * Returns true if names match closely enough
  */
 function namesMatch(name1, name2) {
   if (!name1 || !name2) return false;
-  
-  // Normalize: lowercase, remove commas/periods, collapse whitespace
-  const normalize = (s) => s.trim().toLowerCase()
-    .replace(/[,.\-]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  
+
+  const normalize = (s) =>
+    s
+      .trim()
+      .toLowerCase()
+      .replace(/[,.\-]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
   const n1 = normalize(name1);
   const n2 = normalize(name2);
-  
+
   console.log("[namesMatch] Raw inputs:", { name1, name2 });
   console.log("[namesMatch] Normalized:", { n1, n2 });
-  
+
   if (n1 === n2) {
     console.log("[namesMatch] Exact match found");
     return true;
   }
-  
-  const parts1 = n1.split(' ').filter(p => p.length > 1);
-  const parts2 = n2.split(' ').filter(p => p.length > 1);
-  
+
+  const parts1 = n1.split(" ").filter((p) => p.length > 1);
+  const parts2 = n2.split(" ").filter((p) => p.length > 1);
+
   console.log("[namesMatch] Parts:", { parts1, parts2 });
-  
+
   const shorter = parts1.length <= parts2.length ? parts1 : parts2;
   const longer = parts1.length <= parts2.length ? parts2 : parts1;
-  
-  const matchCount = shorter.filter(sp => longer.includes(sp)).length;
+
+  const matchCount = shorter.filter((sp) => longer.includes(sp)).length;
   const minRequired = shorter.length === 1 ? 1 : 2;
-  
+
   console.log("[namesMatch] Match analysis:", { matchCount, minRequired, result: matchCount >= minRequired });
-  
+
   return matchCount >= minRequired;
 }
 
@@ -316,7 +322,11 @@ export default async function handler(req, res) {
           requires_additional_guest: session.requires_additional_guest ?? null,
 
           physical_room: session.physical_room ?? null,
+
+          // ✅ FIX: return BOTH keys to avoid camel/snake mismatch bugs
+          room_access_code: session.room_access_code ?? null,
           roomAccessCode: session.room_access_code ?? null,
+
           cloudbeds_reservation_id: session.cloudbeds_reservation_id ?? null,
 
           visitor_access_code: session.visitor_access_code ?? null,
@@ -330,7 +340,7 @@ export default async function handler(req, res) {
     }
 
     // ============================================
-    // ACTION: verify_face (UPDATED)
+    // ACTION: verify_face
     // ============================================
     if (action === "verify_face") {
       const { session_token, selfie_data } = req.body || {};
@@ -350,10 +360,8 @@ export default async function handler(req, res) {
       }
       if (!session) return safeJson(res, 404, { error: "Session not found" });
 
-      // ✅ Get the session's flow type first (default guest via normalize)
       const flow_type = normalizeFlowType(session.flow_type);
 
-      // ✅ Visitors should never reach this, but guard anyway
       if (flow_type === "visitor") {
         return safeJson(res, 400, { error: "Face verification not required for visitors" });
       }
@@ -414,33 +422,39 @@ export default async function handler(req, res) {
 
       const guest_verified = isLive && similarity >= 0.40;
 
-      const verifiedAfter = guest_verified
-        ? Math.min(verifiedBefore + 1, expected)
-        : verifiedBefore;
+      const verifiedAfter = guest_verified ? Math.min(verifiedBefore + 1, expected) : verifiedBefore;
 
       const requiresAdditionalGuest = verifiedAfter < expected;
       const overallVerified = verifiedAfter >= expected;
 
-      let physical_room = null;
-      let room_access_code = null;
-      let cloudbeds_reservation_id = null;
+      // ✅ FIX: default to existing DB values so we never overwrite with null on lookup failures
+      let physical_room = session.physical_room ?? null;
+      let room_access_code = session.room_access_code ?? null;
+      let cloudbeds_reservation_id = session.cloudbeds_reservation_id ?? null;
 
-      // ✅ Only run Cloudbeds checks for GUEST flow
-      if (guest_verified && flow_type === "guest" && session.room_number && BACKEND_URL) {
-        try {
-          const cloudbeds = await fetchCloudbedsReservation(session.room_number);
+      // ✅ FIX: Prefer true Cloudbeds reservation id for lookup (works for OTA thirdPartyIdentifier flows)
+      if (guest_verified && flow_type === "guest" && BACKEND_URL) {
+        const lookupRef = session.cloudbeds_reservation_id || session.room_number;
 
-          // ✅ Check-in validation (GUEST ONLY) -> only error message here
-          const guestIsCheckedIn = getGuestIsCheckedIn(cloudbeds);
-          if (!guestIsCheckedIn) {
-            return safeJson(res, 400, { error: "guest check in required" });
+        if (lookupRef) {
+          try {
+            const cloudbeds = await fetchCloudbedsReservation(String(lookupRef));
+
+            const guestIsCheckedIn = getGuestIsCheckedIn(cloudbeds);
+            if (!guestIsCheckedIn) {
+              return safeJson(res, 400, { error: "guest check in required" });
+            }
+
+            // ✅ only overwrite if Cloudbeds returns values
+            if (cloudbeds.roomName) physical_room = cloudbeds.roomName;
+            if (cloudbeds.accessCode) room_access_code = cloudbeds.accessCode;
+
+            cloudbeds_reservation_id =
+              cloudbeds.reservationId || cloudbeds_reservation_id || String(lookupRef);
+          } catch (cbErr) {
+            console.error("[Cloudbeds] Lookup failed (no overwrite):", cbErr?.message || cbErr);
+            // keep existing values
           }
-
-          physical_room = cloudbeds.roomName || null;
-          room_access_code = cloudbeds.accessCode || null;
-          cloudbeds_reservation_id = cloudbeds.reservationId || session.room_number;
-        } catch (cbErr) {
-          console.error("[Cloudbeds] Lookup failed:", cbErr?.message || cbErr);
         }
       }
 
@@ -555,7 +569,7 @@ export default async function handler(req, res) {
     }
 
     // ============================================
-    // ACTION: update_guest (UPDATED WITH NAME VALIDATION)
+    // ACTION: update_guest
     // ============================================
     if (action === "update_guest") {
       const { session_token, guest_name, booking_ref, flow_type } = req.body || {};
@@ -564,7 +578,6 @@ export default async function handler(req, res) {
       if (!guest_name) return safeJson(res, 400, { error: "Guest name required" });
       if (flow_type !== "visitor" && !booking_ref) return safeJson(res, 400, { error: "Booking reference required" });
 
-      // ✅ Get the session's flow type first
       const { data: sess, error: sessErr } = await supabase
         .from("demo_sessions")
         .select("flow_type")
@@ -573,9 +586,9 @@ export default async function handler(req, res) {
 
       if (sessErr || !sess) return safeJson(res, 404, { error: "Session not found" });
 
-      const flowType = normalizeFlowType(sess.flow_type); // default guest
+      const flowType = normalizeFlowType(sess.flow_type);
 
-      // ✅ For VISITOR flow, skip Cloudbeds entirely
+      // Visitor flow: skip Cloudbeds
       if (flowType === "visitor") {
         const { error: updateErr } = await supabase
           .from("demo_sessions")
@@ -606,45 +619,28 @@ export default async function handler(req, res) {
         });
       }
 
-      // ✅ Only run Cloudbeds checks for GUEST flow
+      // Guest flow: Cloudbeds verification
       try {
         const cloudbeds = await fetchCloudbedsReservation(booking_ref);
-        
-        console.log("[verify.js] Cloudbeds response:", {
-          reservationId: cloudbeds.reservationId,
-          guestName: cloudbeds.guestName,
-          roomName: cloudbeds.roomName,
-          accessCode: cloudbeds.accessCode,
-          otaIdentifier: cloudbeds.otaIdentifier
-        });
 
-        // ✅ NAME VALIDATION: Compare input name with Cloudbeds reservation name
         const inputName = (guest_name || "").trim();
         const cbName = (cloudbeds.guestName || "").trim();
-        
+
         console.log("[verify.js] Name comparison - Input:", JSON.stringify(inputName), "Cloudbeds:", JSON.stringify(cbName));
-        
+
         if (!namesMatch(inputName, cbName)) {
-          // ✅ FALLBACK: If this was an OTA lookup and we have a Cloudbeds reservation ID, try that
           if (cloudbeds.reservationId && cloudbeds.reservationId !== booking_ref) {
             console.log("[verify.js] Name mismatch with OTA lookup, trying Cloudbeds reservation ID:", cloudbeds.reservationId);
-            
+
             try {
               const cloudbedsSecondary = await fetchCloudbedsReservation(cloudbeds.reservationId);
               const cbNameSecondary = (cloudbedsSecondary.guestName || "").trim();
-              
-              console.log("[verify.js] Secondary lookup result:", {
-                reservationId: cloudbedsSecondary.reservationId,
-                guestName: cloudbedsSecondary.guestName,
-                roomName: cloudbedsSecondary.roomName,
-                accessCode: cloudbedsSecondary.accessCode
-              });
+
               console.log("[verify.js] Secondary lookup name:", JSON.stringify(cbNameSecondary));
-              
+
               if (namesMatch(inputName, cbNameSecondary)) {
                 console.log("[verify.js] Name matched with Cloudbeds reservation ID lookup");
-                
-                // ✅ FIXED: Use the correct reservation ID and access code from secondary lookup
+
                 const { error: updateErr } = await supabase
                   .from("demo_sessions")
                   .update({
@@ -676,30 +672,21 @@ export default async function handler(req, res) {
               console.warn("[verify.js] Secondary Cloudbeds lookup failed:", secondaryErr);
             }
           }
-          
+
           console.log("[verify.js] Name mismatch - Input:", inputName, "Cloudbeds:", cbName);
-          return safeJson(res, 400, { 
+          return safeJson(res, 400, {
             error: "name_mismatch_reservation",
             details: {
               provided: inputName,
-              expected: cbName
-            }
+              expected: cbName,
+            },
           });
         }
 
-        // ✅ Check reservation check-in status (only if backend provides it)
         const guestIsCheckedIn = getGuestIsCheckedIn(cloudbeds);
         if (!guestIsCheckedIn) {
           return safeJson(res, 400, { error: "guest check in required" });
         }
-
-        // 🔍 DEBUG: Log what we're about to store
-        console.log("[verify.js] About to store in database:", {
-          cloudbeds_reservation_id: cloudbeds.reservationId,
-          physical_room: cloudbeds.roomName,
-          room_access_code: cloudbeds.accessCode,
-          has_access_code: !!cloudbeds.accessCode
-        });
 
         const { error: updateErr } = await supabase
           .from("demo_sessions")
@@ -762,7 +749,7 @@ export default async function handler(req, res) {
     }
 
     // ============================================
-    // ACTION: upload_document (UPDATED WITH TEXTRACT NAME VALIDATION)
+    // ACTION: upload_document
     // ============================================
     if (action === "upload_document") {
       const { session_token, image_data } = req.body || {};
@@ -770,7 +757,6 @@ export default async function handler(req, res) {
       if (!session_token) return safeJson(res, 400, { error: "Session token required" });
       if (!image_data) return safeJson(res, 400, { error: "image_data required" });
 
-      // Get session first (flow type is the key) - NOW INCLUDING guest_name
       const { data: sess, error: sessErr } = await supabase
         .from("demo_sessions")
         .select("flow_type, expected_guest_count, verified_guest_count, guest_name")
@@ -779,7 +765,7 @@ export default async function handler(req, res) {
 
       if (sessErr || !sess) return safeJson(res, 404, { error: "Session not found" });
 
-      const flowType = normalizeFlowType(sess.flow_type); // default guest
+      const flowType = normalizeFlowType(sess.flow_type);
 
       const base64Data = normalizeBase64(image_data);
       if (!base64Data) return safeJson(res, 400, { error: "Invalid image_data format" });
@@ -789,25 +775,23 @@ export default async function handler(req, res) {
 
       const expected = clampInt(sess.expected_guest_count, 0, 10);
       const verifiedBefore = clampInt(sess.verified_guest_count, 0, 10);
-      const guestIndex =
-        flowType === "visitor" ? 1 : clampInt(verifiedBefore + 1, 1, expected || 1);
+      const guestIndex = flowType === "visitor" ? 1 : clampInt(verifiedBefore + 1, 1, expected || 1);
 
-      // ✅ TEXTRACT NAME VALIDATION (GUEST FLOW ONLY)
+      // Textract name validation (guest flow only)
       if (flowType === "guest" && sess.guest_name) {
         try {
           console.log("[verify.js] Running Textract ID analysis...");
-          
+
           const analyzeRes = await textract.send(
             new AnalyzeIDCommand({
-              DocumentPages: [{ Bytes: imageBuffer }]
+              DocumentPages: [{ Bytes: imageBuffer }],
             })
           );
 
           const fields = analyzeRes.IdentityDocuments?.[0]?.IdentityDocumentFields || [];
-          
-          // Helper to extract field value
+
           const getField = (type) => {
-            const field = fields.find(f => f.Type?.Text === type);
+            const field = fields.find((f) => f.Type?.Text === type);
             return field?.ValueDetection?.Text || "";
           };
 
@@ -819,28 +803,24 @@ export default async function handler(req, res) {
 
           const storedName = (sess.guest_name || "").trim();
 
-          // ✅ NAME VALIDATION: Compare document name with stored guest name
           if (docFullName && storedName && !namesMatch(docFullName, storedName)) {
             console.log("[verify.js] Document name mismatch - Document:", docFullName, "Expected:", storedName);
-            return safeJson(res, 400, { 
+            return safeJson(res, 400, {
               error: "name_mismatch_document",
               details: {
                 document: docFullName,
-                expected: storedName
-              }
+                expected: storedName,
+              },
             });
           }
 
           console.log("[verify.js] Document name validation passed");
-
         } catch (textractErr) {
           console.error("[verify.js] Textract analysis failed:", textractErr);
-          // Continue without name validation if Textract fails
-          // You can optionally make this a hard failure by returning an error here
+          // continue without hard failing
         }
       }
 
-      // Continue with S3 upload
       const s3Key = `demo/${session_token}/document_${guestIndex}.jpg`;
 
       await s3.send(
@@ -854,7 +834,7 @@ export default async function handler(req, res) {
 
       const documentUrl = `s3://${BUCKET}/${s3Key}`;
 
-      // ✅ For VISITOR flow, skip Cloudbeds entirely & generate 6-digit access code
+      // Visitor flow: generate 6-digit access code
       if (flowType === "visitor") {
         const accessCode = generateSixDigitCode();
         const grantedAt = new Date();
@@ -887,7 +867,7 @@ export default async function handler(req, res) {
         });
       }
 
-      // ✅ Guest flow continues (no Cloudbeds here; Cloudbeds check happens in update_guest/verify_face)
+      // Guest flow: proceed
       const { error: updateErr } = await supabase
         .from("demo_sessions")
         .update({
