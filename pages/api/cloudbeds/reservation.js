@@ -1,4 +1,4 @@
-// current weds 707-  reservation.js — FIXED: OTA always resolves to real Cloudbeds reservationID
+// reservation.fixed-  reservation.js — FIXED: OTA always resolves to real Cloudbeds reservationID
 const CLOUDBED_API_KEY = process.env.CLOUDBEDS_API_KEY;
 const CLOUDBEDS_PROPERTY_ID = process.env.CLOUDBEDS_PROPERTY_EXTERNAL_ID;
 const CLOUDBEDS_API_BASE = "https://hotels.cloudbeds.com/api/v1.2";
@@ -179,15 +179,51 @@ export default async function handler(req, res) {
     // ========== STEP 1: resolve Cloudbeds reservationID ==========
     if (otaIdentifier) {
       otaLookup = true;
-      console.log("[Cloudbeds] OTA lookup thirdPartyIdentifier:", otaIdentifier);
+      console.log("[Cloudbeds] OTA lookup identifier:", otaIdentifier);
 
-      const url = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${CLOUDBEDS_PROPERTY_ID}&thirdPartyIdentifier=${encodeURIComponent(
-        otaIdentifier
-      )}`;
+      const base = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${CLOUDBEDS_PROPERTY_ID}`;
 
-      const cbData = await fetchCloudbedsAPI(url, headers);
-      const list = Array.isArray(cbData?.data) ? cbData.data : cbData?.data ? [cbData.data] : [];
-      if (!list.length) return res.status(404).json({ success: false, error: "Reservation not found" });
+      // Cloudbeds has historically used slightly different query param names depending on API version/source.
+      // We try a small, deterministic set of candidates and accept the first that returns at least one row.
+      const paramCandidates = [
+        // Most common (docs)
+        ["thirdPartyIdentifier", otaIdentifier],
+
+        // Seen in dashboards as "Source Reservation ID"
+        ["sourceReservationID", otaIdentifier],
+        ["sourceReservationId", otaIdentifier],
+
+        // Channel/OTA naming variants
+        ["channelReservationID", otaIdentifier],
+        ["channelReservationId", otaIdentifier],
+        ["thirdPartyReservationID", otaIdentifier],
+        ["thirdPartyReservationId", otaIdentifier],
+      ];
+
+      const tryFetchList = async (paramKey, value) => {
+        const url = `${base}&${paramKey}=${encodeURIComponent(String(value))}`;
+        try {
+          const cbData = await fetchCloudbedsAPI(url, headers);
+          const list = Array.isArray(cbData?.data) ? cbData.data : cbData?.data ? [cbData.data] : [];
+          return list;
+        } catch (e) {
+          // Invalid param / 4xx / etc -> treat as a miss and continue
+          return [];
+        }
+      };
+
+      let list = [];
+      for (const [k, v] of paramCandidates) {
+        list = await tryFetchList(k, v);
+        if (list.length) {
+          console.log("[Cloudbeds] OTA lookup matched via param:", k, "rows:", list.length);
+          break;
+        }
+      }
+
+      if (!list.length) {
+        return res.status(404).json({ success: false, error: "Reservation not found" });
+      }
 
       // Find first row that contains a real Cloudbeds reservationID (not pure digits)
       for (const row of list) {
@@ -199,13 +235,13 @@ export default async function handler(req, res) {
       }
 
       // Fallback: if still none, try any reservationID field anyway
-      if (!rid) {
-        rid = getReservationIdFromRow(list[0]);
-      }
+      if (!rid) rid = getReservationIdFromRow(list[0]);
 
       if (!rid || !looksLikeCloudbedsReservationId(rid)) {
         console.error("[Cloudbeds] OTA lookup did not produce a valid Cloudbeds reservationID. Candidate:", rid);
-        return res.status(404).json({ success: false, error: "Could not resolve Cloudbeds reservationID from OTA lookup" });
+        return res
+          .status(404)
+          .json({ success: false, error: "Could not resolve Cloudbeds reservationID from OTA lookup" });
       }
     } else if (sub_reservation_id) {
       const mainId = String(sub_reservation_id).split("-")[0];
