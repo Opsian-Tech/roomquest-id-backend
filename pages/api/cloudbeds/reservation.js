@@ -1,4 +1,4 @@
-// reservation.js — FIXED: OTA always resolves to real Cloudbeds reservationID with door code
+// shaisaiah reservation.js — FIXED: OTA always resolves to real Cloudbeds reservationID
 const CLOUDBED_API_KEY = process.env.CLOUDBEDS_API_KEY;
 const CLOUDBEDS_PROPERTY_ID = process.env.CLOUDBEDS_PROPERTY_EXTERNAL_ID;
 const CLOUDBEDS_API_BASE = "https://hotels.cloudbeds.com/api/v1.2";
@@ -16,11 +16,9 @@ function setCors(res) {
 function norm(v) {
   return String(v ?? "").trim().toLowerCase();
 }
-
 function normKey(v) {
   return norm(v).replace(/\s+/g, "").replace(/[_-]/g, "");
 }
-
 function isCheckedInStatus(status) {
   const s = normKey(status);
   return s === "checkedin" || s === "inhouse";
@@ -52,13 +50,15 @@ async function fetchCloudbedsAPI(url, headers) {
 }
 
 function getReservationIdFromRow(row) {
+  // Cloudbeds sometimes uses reservationID vs reservationId
   return row?.reservationID || row?.reservationId || row?.reservation_id || null;
 }
 
 function looksLikeCloudbedsReservationId(id) {
+  // Cloudbeds reservation IDs (like 490GYSS9MN) are not purely digits
   const s = String(id || "").trim();
   if (!s) return false;
-  if (/^\d+$/.test(s)) return false;
+  if (/^\d+$/.test(s)) return false; // reject pure numeric OTA ids
   return true;
 }
 
@@ -88,7 +88,6 @@ function getCustomFieldValue(f) {
 }
 
 function extractDoorCode(fullReservation, sub_reservation_id) {
-  // Check top-level fields first
   const top = [
     fullReservation?.accessCode,
     fullReservation?.access_code,
@@ -97,20 +96,14 @@ function extractDoorCode(fullReservation, sub_reservation_id) {
     fullReservation?.roomAccessCode,
     fullReservation?.room_access_code,
   ].filter(Boolean);
-  if (top.length) {
-    console.log("[Cloudbeds] Found door code in top-level:", top[0]);
-    return String(top[0]);
-  }
+  if (top.length) return String(top[0]);
 
-  // Check assigned rooms
   let assigned = fullReservation?.assigned || [];
   if (!Array.isArray(assigned)) assigned = [];
-  
   if (sub_reservation_id && assigned.length > 1) {
     const subMatch = assigned.find((s) => String(s?.subReservationID) === String(sub_reservation_id));
     if (subMatch) assigned = [subMatch];
   }
-  
   if (assigned.length) {
     const a = assigned[0];
     const aTop = [
@@ -118,20 +111,16 @@ function extractDoorCode(fullReservation, sub_reservation_id) {
       a?.accessCode, a?.access_code,
       a?.roomAccessCode, a?.room_access_code
     ].filter(Boolean);
-    if (aTop.length) {
-      console.log("[Cloudbeds] Found door code in assigned:", aTop[0]);
-      return String(aTop[0]);
-    }
+    if (aTop.length) return String(aTop[0]);
   }
 
-  // Check custom fields
   const customFields = Array.isArray(fullReservation?.customFields) ? fullReservation.customFields : [];
-  console.log("[Cloudbeds] Searching customFields for door code, count:", customFields.length);
 
+  // robust match: door+code fuzzy and PIN/keycode fallbacks
   const pick = customFields.find((f) => {
-    const name = norm(f?.customFieldName || "");
-    const shortcode = norm(f?.customFieldShortcode ?? f?.customFieldShortCode ?? "");
-    const id = norm(f?.customFieldID || "");
+    const name = norm(f?.customFieldName);
+    const shortcode = norm(f?.customFieldShortcode ?? f?.customFieldShortCode);
+    const id = norm(f?.customFieldID);
     const blob = `${name} ${shortcode} ${id}`;
 
     return (
@@ -146,13 +135,9 @@ function extractDoorCode(fullReservation, sub_reservation_id) {
 
   if (pick) {
     const v = getCustomFieldValue(pick);
-    if (v) {
-      console.log("[Cloudbeds] Found door code in customFields:", v);
-      return String(v);
-    }
+    if (v) return String(v);
   }
 
-  console.log("[Cloudbeds] No door code found");
   return null;
 }
 
@@ -201,13 +186,10 @@ export default async function handler(req, res) {
       )}`;
 
       const cbData = await fetchCloudbedsAPI(url, headers);
-      let list = Array.isArray(cbData?.data) ? cbData.data : cbData?.data ? [cbData.data] : [];
-      
-      if (!list.length) {
-        return res.status(404).json({ success: false, error: "Reservation not found" });
-      }
+      const list = Array.isArray(cbData?.data) ? cbData.data : cbData?.data ? [cbData.data] : [];
+      if (!list.length) return res.status(404).json({ success: false, error: "Reservation not found" });
 
-      // Find first row with valid Cloudbeds reservationID
+      // Find first row that contains a real Cloudbeds reservationID (not pure digits)
       for (const row of list) {
         const candidate = getReservationIdFromRow(row);
         if (looksLikeCloudbedsReservationId(candidate)) {
@@ -216,6 +198,7 @@ export default async function handler(req, res) {
         }
       }
 
+      // Fallback: if still none, try any reservationID field anyway
       if (!rid) {
         rid = getReservationIdFromRow(list[0]);
       }
@@ -224,8 +207,6 @@ export default async function handler(req, res) {
         console.error("[Cloudbeds] OTA lookup did not produce a valid Cloudbeds reservationID. Candidate:", rid);
         return res.status(404).json({ success: false, error: "Could not resolve Cloudbeds reservationID from OTA lookup" });
       }
-
-      console.log("[Cloudbeds] Resolved OTA identifier", otaIdentifier, "to Cloudbeds reservationID:", rid);
     } else if (sub_reservation_id) {
       const mainId = String(sub_reservation_id).split("-")[0];
       rid = mainId;
@@ -235,19 +216,15 @@ export default async function handler(req, res) {
       return res.status(400).json({ success: false, error: "Missing reservation identifier" });
     }
 
-    // ========== STEP 2: fetch full reservation with getReservation ==========
-    console.log("[Cloudbeds] Fetching full reservation details via getReservation:", rid);
+    // ========== STEP 2: fetch full reservation ==========
+    console.log("[Cloudbeds] Fetching full reservation via getReservation:", rid);
     const fullUrl = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${encodeURIComponent(rid)}`;
     const fullData = await fetchCloudbedsAPI(fullUrl, headers);
     const fullReservation = fullData?.data;
 
-    if (!fullReservation) {
-      return res.status(404).json({ success: false, error: "Reservation not found" });
-    }
+    if (!fullReservation) return res.status(404).json({ success: false, error: "Reservation not found" });
 
-    console.log("[Cloudbeds] Full reservation data retrieved for:", rid);
-
-    // ========== STEP 3: extract room and door code ==========
+    // ========== STEP 3: extract ==========
     const roomName = extractRoomName(fullReservation, sub_reservation_id);
     const accessCode = extractDoorCode(fullReservation, sub_reservation_id);
     const status = fullReservation?.status || null;
@@ -266,11 +243,6 @@ export default async function handler(req, res) {
     };
 
     console.log("[Cloudbeds] FINAL RESULT:", JSON.stringify(result, null, 2));
-    
-    if (!accessCode) {
-      console.warn("[Cloudbeds] WARNING: No door code found for reservation:", rid);
-    }
-
     return res.status(200).json(result);
   } catch (e) {
     const msg = String(e?.message || "");
