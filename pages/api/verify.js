@@ -51,43 +51,35 @@ const textract = new TextractClient({
   },
 });
 
-async function fetchCloudbedsReservation(bookingRef) {
-  console.log("[Cloudbeds] Fetching reservation:", bookingRef);
+async function fetchCloudbedsReservation(reservationId) {
+  console.log("[Cloudbeds] Fetching reservation:", reservationId);
 
-  // Try reservationID first, then thirdPartyIdentifier, then subReservationID
-  const lookups = [
-    { reservation_id: bookingRef },
-    { third_party_identifier: bookingRef },
-  ];
+  const res = await fetch(`${BACKEND_URL}/api/cloudbeds/reservation`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reservation_id: reservationId }),
+  });
 
-  // If it looks like a sub-reservation (contains "-"), also try the parent
-  if (bookingRef.includes("-")) {
-    lookups.push({ reservation_id: bookingRef.split("-")[0], sub_reservation_id: bookingRef });
+  if (!res.ok) {
+    const errorText = await res.text();
+    console.error("[Cloudbeds] Request failed:", res.status, errorText);
+    throw new Error("Cloudbeds request failed");
   }
 
-  for (const body of lookups) {
-    try {
-      const res = await fetch(`${BACKEND_URL}/api/cloudbeds/reservation`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
+  const data = await res.json();
 
-      if (!res.ok) continue;
-      const data = await res.json();
-      if (data?.success) {
-        console.log("[Cloudbeds] Found via", Object.keys(body)[0], ":", {
-          roomName: data.roomName,
-          accessCode: data.accessCode,
-        });
-        return data;
-      }
-    } catch (e) {
-      console.warn("[Cloudbeds] Lookup failed for", body, e.message);
-    }
+  if (!data?.success) {
+    console.error("[Cloudbeds] Invalid response:", data);
+    throw new Error("Invalid Cloudbeds response");
   }
 
-  throw new Error("Reservation not found in Cloudbeds");
+  console.log("[Cloudbeds] Success:", {
+    roomName: data.roomName,
+    accessCode: data.accessCode,
+    checkedIn: data.checkedIn ?? data.isCheckedIn ?? data.guestIsCheckedIn,
+  });
+
+  return data;
 }
 
 function setCors(res) {
@@ -362,7 +354,7 @@ export default async function handler(req, res) {
       const similarity = (compare.FaceMatches?.[0]?.Similarity || 0) / 100;
       const verificationScore = (isLive ? 0.4 : 0) + livenessScore * 0.3 + similarity * 0.3;
 
-      const guest_verified = isLive && similarity >= 0.40;
+      const guest_verified = isLive && similarity >= 0.65;
 
       const verifiedAfter = guest_verified
         ? Math.min(verifiedBefore + 1, expected)
@@ -508,11 +500,11 @@ export default async function handler(req, res) {
     // ACTION: update_guest (UPDATED)
     // ============================================
     if (action === "update_guest") {
-      const { session_token, guest_name, booking_ref, flow_type } = req.body || {};
+      const { session_token, guest_name, booking_ref } = req.body || {};
 
       if (!session_token) return safeJson(res, 400, { error: "Session token required" });
       if (!guest_name) return safeJson(res, 400, { error: "Guest name required" });
-     if (flow_type !== "visitor" && !booking_ref) return safeJson(res, 400, { error: "Booking reference required" });
+     if (flowType !== "visitor" && !booking_ref) return safeJson(res, 400, { error: "Booking reference required" });
 
       // ✅ Get the session's flow type first
       const { data: sess, error: sessErr } = await supabase
