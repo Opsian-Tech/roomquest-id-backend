@@ -20,7 +20,7 @@ const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 /**
  * BUILD MARKER
  */
-const BUILD_ID = "cloudbeds-integration-v1";
+const BUILD_ID = "cloudbeds-integration-v11";
 
 if (!SUPABASE_URL) console.warn("Missing env: NEXT_PUBLIC_SUPABASE_URL");
 if (!SUPABASE_SERVICE_KEY) console.warn("Missing env: SUPABASE_SERVICE_KEY");
