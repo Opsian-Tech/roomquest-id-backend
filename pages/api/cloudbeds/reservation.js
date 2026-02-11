@@ -1,47 +1,48 @@
-// pages/api/cloudbeds/reservation.js
+// reservation.js — FIXED: OTA always resolves to real Cloudbeds reservationID with door code
 const CLOUDBED_API_KEY = process.env.CLOUDBEDS_API_KEY;
 const CLOUDBEDS_PROPERTY_ID = process.env.CLOUDBEDS_PROPERTY_EXTERNAL_ID;
 const CLOUDBEDS_API_BASE = "https://hotels.cloudbeds.com/api/v1.2";
-
-// ✅ change this string each deploy to prove you’re hitting the new code
-const BUILD_ID = "reservation-ota-fix-v5";
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS,POST");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Requested-With, Accept, Origin, Authorization");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, X-Requested-With, Accept, Origin, Authorization"
+  );
 }
 
 function norm(v) {
   return String(v ?? "").trim().toLowerCase();
 }
+
 function normKey(v) {
   return norm(v).replace(/\s+/g, "").replace(/[_-]/g, "");
 }
+
 function isCheckedInStatus(status) {
   const s = normKey(status);
   return s === "checkedin" || s === "inhouse";
 }
 
 async function fetchCloudbedsAPI(url, headers) {
+  console.log("[Cloudbeds] URL:", url);
   const cbRes = await fetch(url, { headers });
-  const text = await cbRes.text().catch(() => "");
-  let cbData = {};
-  try {
-    cbData = text ? JSON.parse(text) : {};
-  } catch {}
 
   if (!cbRes.ok) {
-    console.error("[Cloudbeds] API error:", cbRes.status, text);
+    const errText = await cbRes.text().catch(() => "");
+    console.error("[Cloudbeds] API error:", cbRes.status, errText);
     const err = new Error(`Cloudbeds API request failed: ${cbRes.status}`);
     err.status = cbRes.status;
-    err.body = text;
+    err.body = errText;
     throw err;
   }
 
+  const cbData = await cbRes.json();
+  console.log("[Cloudbeds] RESPONSE:", JSON.stringify(cbData, null, 2));
+
   if (!cbData?.success) {
-    console.error("[Cloudbeds] success=false payload:", cbData);
     const err = new Error("Cloudbeds API returned success=false");
     err.status = 502;
     throw err;
@@ -87,6 +88,7 @@ function getCustomFieldValue(f) {
 }
 
 function extractDoorCode(fullReservation, sub_reservation_id) {
+  // Check top-level fields first
   const top = [
     fullReservation?.accessCode,
     fullReservation?.access_code,
@@ -95,27 +97,37 @@ function extractDoorCode(fullReservation, sub_reservation_id) {
     fullReservation?.roomAccessCode,
     fullReservation?.room_access_code,
   ].filter(Boolean);
-  if (top.length) return String(top[0]);
+  if (top.length) {
+    console.log("[Cloudbeds] Found door code in top-level:", top[0]);
+    return String(top[0]);
+  }
 
+  // Check assigned rooms
   let assigned = fullReservation?.assigned || [];
   if (!Array.isArray(assigned)) assigned = [];
-
+  
   if (sub_reservation_id && assigned.length > 1) {
     const subMatch = assigned.find((s) => String(s?.subReservationID) === String(sub_reservation_id));
     if (subMatch) assigned = [subMatch];
   }
-
+  
   if (assigned.length) {
     const a = assigned[0];
     const aTop = [
       a?.doorCode, a?.door_code,
       a?.accessCode, a?.access_code,
-      a?.roomAccessCode, a?.room_access_code,
+      a?.roomAccessCode, a?.room_access_code
     ].filter(Boolean);
-    if (aTop.length) return String(aTop[0]);
+    if (aTop.length) {
+      console.log("[Cloudbeds] Found door code in assigned:", aTop[0]);
+      return String(aTop[0]);
+    }
   }
 
+  // Check custom fields
   const customFields = Array.isArray(fullReservation?.customFields) ? fullReservation.customFields : [];
+  console.log("[Cloudbeds] Searching customFields for door code, count:", customFields.length);
+
   const pick = customFields.find((f) => {
     const name = norm(f?.customFieldName || "");
     const shortcode = norm(f?.customFieldShortcode ?? f?.customFieldShortCode ?? "");
@@ -134,44 +146,13 @@ function extractDoorCode(fullReservation, sub_reservation_id) {
 
   if (pick) {
     const v = getCustomFieldValue(pick);
-    if (v) return String(v);
-  }
-
-  return null;
-}
-
-async function resolveRidFromOta(otaIdentifier, headers) {
-  const base = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${encodeURIComponent(CLOUDBEDS_PROPERTY_ID)}`;
-
-  const paramCandidates = [
-    ["thirdPartyIdentifier", otaIdentifier],
-    ["sourceReservationID", otaIdentifier],
-    ["sourceReservationId", otaIdentifier],
-    ["channelReservationID", otaIdentifier],
-    ["channelReservationId", otaIdentifier],
-    ["thirdPartyReservationID", otaIdentifier],
-    ["thirdPartyReservationId", otaIdentifier],
-  ];
-
-  for (const [k, v] of paramCandidates) {
-    const url = `${base}&${k}=${encodeURIComponent(String(v))}`;
-    try {
-      const cbData = await fetchCloudbedsAPI(url, headers);
-      const list = Array.isArray(cbData?.data) ? cbData.data : cbData?.data ? [cbData.data] : [];
-      if (!list.length) continue;
-
-      for (const row of list) {
-        const candidate = getReservationIdFromRow(row);
-        if (looksLikeCloudbedsReservationId(candidate)) return candidate;
-      }
-
-      const fallback = getReservationIdFromRow(list[0]);
-      if (looksLikeCloudbedsReservationId(fallback)) return fallback;
-    } catch {
-      // miss, continue
+    if (v) {
+      console.log("[Cloudbeds] Found door code in customFields:", v);
+      return String(v);
     }
   }
 
+  console.log("[Cloudbeds] No door code found");
   return null;
 }
 
@@ -179,11 +160,11 @@ export default async function handler(req, res) {
   setCors(res);
 
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ success: false, error: "Method not allowed", build_id: BUILD_ID });
+  if (req.method !== "POST") return res.status(405).json({ success: false, error: "Method not allowed" });
 
   try {
-    if (!CLOUDBED_API_KEY) return res.status(500).json({ success: false, error: "Missing CLOUDBEDS_API_KEY", build_id: BUILD_ID });
-    if (!CLOUDBEDS_PROPERTY_ID) return res.status(500).json({ success: false, error: "Missing CLOUDBEDS_PROPERTY_EXTERNAL_ID", build_id: BUILD_ID });
+    if (!CLOUDBED_API_KEY) return res.status(500).json({ success: false, error: "Missing CLOUDBEDS_API_KEY" });
+    if (!CLOUDBEDS_PROPERTY_ID) return res.status(500).json({ success: false, error: "Missing CLOUDBEDS_PROPERTY_EXTERNAL_ID" });
 
     const {
       reservation_id,
@@ -207,56 +188,72 @@ export default async function handler(req, res) {
       third_party_reservation_id ||
       ota_reservation_id;
 
+    let otaLookup = false;
     let rid = null;
 
+    // ========== STEP 1: resolve Cloudbeds reservationID ==========
     if (otaIdentifier) {
-      rid = await resolveRidFromOta(String(otaIdentifier), headers);
-      if (!rid) {
-        return res.status(404).json({ success: false, error: "Could not resolve Cloudbeds reservationID from OTA identifier", build_id: BUILD_ID });
+      otaLookup = true;
+      console.log("[Cloudbeds] OTA lookup thirdPartyIdentifier:", otaIdentifier);
+
+      const url = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${CLOUDBEDS_PROPERTY_ID}&thirdPartyIdentifier=${encodeURIComponent(
+        otaIdentifier
+      )}`;
+
+      const cbData = await fetchCloudbedsAPI(url, headers);
+      let list = Array.isArray(cbData?.data) ? cbData.data : cbData?.data ? [cbData.data] : [];
+      
+      if (!list.length) {
+        return res.status(404).json({ success: false, error: "Reservation not found" });
       }
+
+      // Find first row with valid Cloudbeds reservationID
+      for (const row of list) {
+        const candidate = getReservationIdFromRow(row);
+        if (looksLikeCloudbedsReservationId(candidate)) {
+          rid = candidate;
+          break;
+        }
+      }
+
+      if (!rid) {
+        rid = getReservationIdFromRow(list[0]);
+      }
+
+      if (!rid || !looksLikeCloudbedsReservationId(rid)) {
+        console.error("[Cloudbeds] OTA lookup did not produce a valid Cloudbeds reservationID. Candidate:", rid);
+        return res.status(404).json({ success: false, error: "Could not resolve Cloudbeds reservationID from OTA lookup" });
+      }
+
+      console.log("[Cloudbeds] Resolved OTA identifier", otaIdentifier, "to Cloudbeds reservationID:", rid);
     } else if (sub_reservation_id) {
-      rid = String(sub_reservation_id).split("-")[0];
+      const mainId = String(sub_reservation_id).split("-")[0];
+      rid = mainId;
     } else if (reservation_id) {
-      rid = String(reservation_id);
+      rid = reservation_id;
     } else {
-      return res.status(400).json({ success: false, error: "Missing reservation identifier", build_id: BUILD_ID });
+      return res.status(400).json({ success: false, error: "Missing reservation identifier" });
     }
 
-    const fullUrl =
-      `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${encodeURIComponent(CLOUDBEDS_PROPERTY_ID)}&reservationID=${encodeURIComponent(String(rid))}`;
-
+    // ========== STEP 2: fetch full reservation with getReservation ==========
+    console.log("[Cloudbeds] Fetching full reservation details via getReservation:", rid);
+    const fullUrl = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${encodeURIComponent(rid)}`;
     const fullData = await fetchCloudbedsAPI(fullUrl, headers);
     const fullReservation = fullData?.data;
 
-    if (!fullReservation) return res.status(404).json({ success: false, error: "Reservation not found", build_id: BUILD_ID });
+    if (!fullReservation) {
+      return res.status(404).json({ success: false, error: "Reservation not found" });
+    }
 
-    const roomName =
-      extractRoomName(fullReservation, sub_reservation_id) ||
-      fullReservation?.roomName ||
-      fullReservation?.roomNumber ||
-      null;
+    console.log("[Cloudbeds] Full reservation data retrieved for:", rid);
 
+    // ========== STEP 3: extract room and door code ==========
+    const roomName = extractRoomName(fullReservation, sub_reservation_id);
     const accessCode = extractDoorCode(fullReservation, sub_reservation_id);
     const status = fullReservation?.status || null;
 
-    const debug = {
-      rid_used: String(rid),
-      got_reservationID: fullReservation?.reservationID || fullReservation?.reservationId || null,
-      top_accessCode: fullReservation?.accessCode || fullReservation?.access_code || null,
-      assigned_count: Array.isArray(fullReservation?.assigned) ? fullReservation.assigned.length : 0,
-      assigned0_roomName: fullReservation?.assigned?.[0]?.roomName || fullReservation?.assigned?.[0]?.roomNumber || null,
-      assigned0_accessCode:
-        fullReservation?.assigned?.[0]?.accessCode ||
-        fullReservation?.assigned?.[0]?.access_code ||
-        fullReservation?.assigned?.[0]?.doorCode ||
-        fullReservation?.assigned?.[0]?.door_code ||
-        null,
-    };
-
-    // ✅ INCLUDE build_id in success response
-    return res.status(200).json({
+    const result = {
       success: true,
-      build_id: BUILD_ID,
       reservationId: fullReservation?.reservationID || fullReservation?.reservationId || rid,
       roomName,
       accessCode,
@@ -264,12 +261,21 @@ export default async function handler(req, res) {
       checkInDate: fullReservation?.startDate || null,
       checkOutDate: fullReservation?.endDate || null,
       status,
-      otaIdentifier: otaIdentifier ? String(otaIdentifier) : null,
+      otaIdentifier: otaLookup ? String(otaIdentifier) : null,
       guestIsCheckedIn: isCheckedInStatus(status),
-      debug,
-    });
+    };
+
+    console.log("[Cloudbeds] FINAL RESULT:", JSON.stringify(result, null, 2));
+    
+    if (!accessCode) {
+      console.warn("[Cloudbeds] WARNING: No door code found for reservation:", rid);
+    }
+
+    return res.status(200).json(result);
   } catch (e) {
+    const msg = String(e?.message || "");
+    const status = e?.status === 404 || msg.includes("not found") ? 404 : 500;
     console.error("[Cloudbeds] ERROR:", e?.message || e);
-    return res.status(500).json({ success: false, error: e?.message || "Server error", build_id: BUILD_ID });
+    return res.status(status).json({ success: false, error: e?.message || "Server error" });
   }
 }
