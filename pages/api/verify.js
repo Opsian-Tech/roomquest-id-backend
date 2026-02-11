@@ -1,4 +1,4 @@
-//updated 1252 Weds/// pages/api/verify.js
+//updated verify.js - Fixed OTA door code retrieval
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
@@ -20,7 +20,7 @@ const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 /**
  * BUILD MARKER
  */
-const BUILD_ID = "cloudbeds-integration-v1";
+const BUILD_ID = "cloudbeds-integration-v1-ota-fixed";
 
 if (!SUPABASE_URL) console.warn("Missing env: NEXT_PUBLIC_SUPABASE_URL");
 if (!SUPABASE_SERVICE_KEY) console.warn("Missing env: SUPABASE_SERVICE_KEY");
@@ -87,6 +87,8 @@ async function fetchCloudbedsReservation(bookingRef) {
           guestName: data.guestName,
           roomName: data.roomName,
           accessCode: data.accessCode,
+          reservationId: data.reservationId,
+          otaIdentifier: data.otaIdentifier,
         });
         return data;
       }
@@ -436,7 +438,7 @@ export default async function handler(req, res) {
 
           physical_room = cloudbeds.roomName || null;
           room_access_code = cloudbeds.accessCode || null;
-          cloudbeds_reservation_id = session.room_number;
+          cloudbeds_reservation_id = cloudbeds.reservationId || session.room_number;
         } catch (cbErr) {
           console.error("[Cloudbeds] Lookup failed:", cbErr?.message || cbErr);
         }
@@ -627,13 +629,14 @@ export default async function handler(req, res) {
               
               if (namesMatch(inputName, cbNameSecondary)) {
                 console.log("[verify.js] Name matched with Cloudbeds reservation ID lookup");
-                // Use the secondary lookup data
+                
+                // ✅ FIXED: Use the correct reservation ID and access code from secondary lookup
                 const { error: updateErr } = await supabase
                   .from("demo_sessions")
                   .update({
                     guest_name,
                     room_number: booking_ref,
-                    cloudbeds_reservation_id: cloudbeds.reservationId,
+                    cloudbeds_reservation_id: cloudbedsSecondary.reservationId,
                     physical_room: cloudbedsSecondary.roomName,
                     room_access_code: cloudbedsSecondary.accessCode,
                     status: "guest_verified",
@@ -651,7 +654,7 @@ export default async function handler(req, res) {
                   success: true,
                   guest_name: cloudbedsSecondary.guestName,
                   room_number: cloudbedsSecondary.roomName,
-                  reservation_id: cloudbeds.reservationId,
+                  reservation_id: cloudbedsSecondary.reservationId,
                   access_code: cloudbedsSecondary.accessCode,
                 });
               }
@@ -681,7 +684,7 @@ export default async function handler(req, res) {
           .update({
             guest_name,
             room_number: booking_ref,
-            cloudbeds_reservation_id: booking_ref,
+            cloudbeds_reservation_id: cloudbeds.reservationId,
             physical_room: cloudbeds.roomName,
             room_access_code: cloudbeds.accessCode,
             status: "guest_verified",
@@ -699,7 +702,7 @@ export default async function handler(req, res) {
           success: true,
           guest_name: cloudbeds.guestName,
           room_number: cloudbeds.roomName,
-          reservation_id: booking_ref,
+          reservation_id: cloudbeds.reservationId,
           access_code: cloudbeds.accessCode,
         });
       } catch (err) {
