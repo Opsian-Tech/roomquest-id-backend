@@ -1,4 +1,5 @@
 // pages/api/cloudbeds/reservation.js
+
 const CLOUDBED_API_KEY = process.env.CLOUDBEDS_API_KEY;
 const CLOUDBEDS_PROPERTY_ID = process.env.CLOUDBEDS_PROPERTY_EXTERNAL_ID;
 const CLOUDBEDS_API_BASE = "https://hotels.cloudbeds.com/api/v1.2";
@@ -23,25 +24,9 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Missing CLOUDBED_API_KEY" });
     }
 
-    const {
-      reservation_id,
-      third_party_identifier,
-      source_reservation_id,
-      channel_reservation_id,
-      third_party_reservation_id,
-      ota_reservation_id,
-      sub_reservation_id,
-    } = req.body || {};
+    const { reservation_id, third_party_identifier, sub_reservation_id } = req.body || {};
 
-    if (
-      !reservation_id &&
-      !third_party_identifier &&
-      !source_reservation_id &&
-      !channel_reservation_id &&
-      !third_party_reservation_id &&
-      !ota_reservation_id &&
-      !sub_reservation_id
-    ) {
+    if (!reservation_id && !third_party_identifier && !sub_reservation_id) {
       return res.status(400).json({ error: "Missing reservation identifier" });
     }
 
@@ -51,44 +36,20 @@ export default async function handler(req, res) {
     };
 
     let url;
-    let lookupType;
 
-    if (sub_reservation_id) {
+    if (third_party_identifier) {
+      // thirdPartyIdentifier requires getReservations (plural)
+      url = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${CLOUDBEDS_PROPERTY_ID}&thirdPartyIdentifier=${third_party_identifier}`;
+    } else if (sub_reservation_id) {
       const mainId = sub_reservation_id.split("-")[0];
       url = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${mainId}`;
-      lookupType = "sub_reservation_id";
-    } else if (reservation_id) {
+    } else {
       url = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${reservation_id}`;
-      lookupType = "reservation_id";
-    } else if (
-      source_reservation_id ||
-      third_party_identifier ||
-      channel_reservation_id ||
-      third_party_reservation_id ||
-      ota_reservation_id
-    ) {
-      // All OTA/third-party lookups use thirdPartyIdentifier parameter
-      // Priority order: source_reservation_id > third_party_identifier > others
-      const identifier =
-        source_reservation_id ||
-        third_party_identifier ||
-        channel_reservation_id ||
-        third_party_reservation_id ||
-        ota_reservation_id;
-
-      url = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${CLOUDBEDS_PROPERTY_ID}&thirdPartyIdentifier=${identifier}`;
-
-      if (source_reservation_id) lookupType = "source_reservation_id";
-      else if (third_party_identifier) lookupType = "third_party_identifier";
-      else if (channel_reservation_id) lookupType = "channel_reservation_id";
-      else if (third_party_reservation_id) lookupType = "third_party_reservation_id";
-      else lookupType = "ota_reservation_id";
     }
 
-    console.log(`[Cloudbeds] Fetching via ${lookupType}:`, url);
+    console.log("[Cloudbeds] Fetching:", url);
 
     const cbRes = await fetch(url, { headers });
-
     if (!cbRes.ok) {
       const errText = await cbRes.text();
       console.error("[Cloudbeds] API error:", cbRes.status, errText);
@@ -96,7 +57,6 @@ export default async function handler(req, res) {
     }
 
     const cbData = await cbRes.json();
-
     if (!cbData.success || !cbData.data) {
       throw new Error("Reservation not found");
     }
@@ -122,54 +82,11 @@ export default async function handler(req, res) {
       roomName = assigned[0].roomName || assigned[0].roomTypeName || null;
     }
 
-    // Extract door code from custom fields - check multiple common field names
     let accessCode = null;
     const customFields = reservation.customFields || [];
-    
-    // Try common door code field names (case-sensitive exact match first)
-    const doorCodeFieldNames = [
-      "DOORCODE",
-      "Door Code",
-      "door code",
-      "Door code",
-      "Access Code",
-      "access code",
-      "Access code",
-      "Room Code",
-      "room code",
-      "Lock Code",
-      "lock code",
-      "Key Code",
-      "key code",
-    ];
-    
-    for (const fieldName of doorCodeFieldNames) {
-      const field = customFields.find((f) => f && String(f.customFieldName || "").trim() === fieldName);
-      if (field && field.customFieldValue != null && String(field.customFieldValue).trim() !== "") {
-        accessCode = String(field.customFieldValue).trim();
-        break;
-      }
-    }
-    
-    // Fallback: case-insensitive search for any field containing "door", "code", "access", "key", or "lock"
-    if (!accessCode && customFields.length > 0) {
-      const lowerNames = ["door", "code", "access", "key", "lock"];
-      const fallback = customFields.find((f) => {
-        if (!f || !f.customFieldName || !f.customFieldValue) return false;
-        const value = String(f.customFieldValue).trim();
-        if (value === "") return false;
-        const name = String(f.customFieldName).toLowerCase();
-        return lowerNames.some((k) => name.includes(k));
-      });
-      if (fallback) {
-        accessCode = String(fallback.customFieldValue).trim();
-      }
-    }
-    
-    // Log available custom field names if no door code found (for debugging)
-    if (!accessCode && customFields.length > 0) {
-      const fieldNames = customFields.map((f) => f?.customFieldName).filter(Boolean);
-      console.warn("[Cloudbeds] No door code found. Available custom fields:", fieldNames.join(", "));
+    const doorCodeField = customFields.find((f) => f.customFieldName === "Door Code");
+    if (doorCodeField) {
+      accessCode = doorCodeField.customFieldValue;
     }
 
     const result = {
@@ -183,8 +100,9 @@ export default async function handler(req, res) {
       status: reservation.status || null,
     };
 
-    console.log(`[Cloudbeds] Success via ${lookupType}:`, result);
+    console.log("[Cloudbeds] Success:", result);
     return res.status(200).json(result);
+
   } catch (e) {
     console.error("[Cloudbeds] Error:", e);
     return res.status(500).json({
