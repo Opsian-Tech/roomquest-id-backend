@@ -387,11 +387,14 @@ export default async function handler(req, res) {
         try {
           const cloudbeds = await fetchCloudbedsReservation(session.room_number);
 
-          // ✅ Check-in validation (GUEST ONLY) -> only error message here
-          const guestIsCheckedIn = getGuestIsCheckedIn(cloudbeds);
-          if (!guestIsCheckedIn) {
-            return safeJson(res, 400, { error: "guest check in required" });
-          }
+          // NEW — accept "confirmed" and "checked_in" statuses:
+    const guestIsCheckedIn = getGuestIsCheckedIn(cloudbeds);
+const statusOk = ["confirmed", "checked_in", "in_house"].includes(
+  String(cloudbeds?.status || "").toLowerCase()
+);
+if (!guestIsCheckedIn && !statusOk) {
+  return safeJson(res, 400, { error: "guest check in required" });
+}
 
           physical_room = cloudbeds.roomName || null;
           room_access_code = cloudbeds.accessCode || null;
