@@ -16,6 +16,7 @@ function setCors(res) {
 
 export default async function handler(req, res) {
   setCors(res);
+
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -35,40 +36,80 @@ export default async function handler(req, res) {
       "Content-Type": "application/json",
     };
 
-    let url;
+    let reservation;
 
     if (third_party_identifier) {
-      // thirdPartyIdentifier requires getReservations (plural)
-      url = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${CLOUDBEDS_PROPERTY_ID}&thirdPartyIdentifier=${third_party_identifier}`;
+      // Step 1: Search by third-party identifier (returns summary array)
+      const searchUrl = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${CLOUDBEDS_PROPERTY_ID}&thirdPartyIdentifier=${third_party_identifier}`;
+      console.log("[Cloudbeds] Step 1 - Searching by thirdPartyIdentifier:", searchUrl);
+
+      const searchRes = await fetch(searchUrl, { headers });
+      if (!searchRes.ok) {
+        const errText = await searchRes.text();
+        console.error("[Cloudbeds] Search API error:", searchRes.status, errText);
+        throw new Error("Cloudbeds API request failed");
+      }
+
+      const searchData = await searchRes.json();
+      if (!searchData.success || !searchData.data) {
+        throw new Error("Reservation not found");
+      }
+
+      const results = Array.isArray(searchData.data) ? searchData.data : [searchData.data];
+      if (results.length === 0) throw new Error("Reservation not found");
+
+      const foundId = results[0].reservationID;
+      if (!foundId) throw new Error("Reservation found but missing reservationID");
+
+      console.log("[Cloudbeds] Step 2 - Fetching full details for reservationID:", foundId);
+
+      // Step 2: Get full reservation details using the found reservationID
+      const detailUrl = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${foundId}`;
+      const detailRes = await fetch(detailUrl, { headers });
+      if (!detailRes.ok) {
+        const errText = await detailRes.text();
+        console.error("[Cloudbeds] Detail API error:", detailRes.status, errText);
+        throw new Error("Failed to fetch full reservation details");
+      }
+
+      const detailData = await detailRes.json();
+      if (!detailData.success || !detailData.data) {
+        throw new Error("Failed to load reservation details");
+      }
+
+      reservation = detailData.data;
     } else if (sub_reservation_id) {
       const mainId = sub_reservation_id.split("-")[0];
-      url = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${mainId}`;
+      const url = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${mainId}`;
+      console.log("[Cloudbeds] Fetching:", url);
+
+      const cbRes = await fetch(url, { headers });
+      if (!cbRes.ok) {
+        const errText = await cbRes.text();
+        console.error("[Cloudbeds] API error:", cbRes.status, errText);
+        throw new Error("Cloudbeds API request failed");
+      }
+
+      const cbData = await cbRes.json();
+      if (!cbData.success || !cbData.data) throw new Error("Reservation not found");
+      reservation = cbData.data;
     } else {
-      url = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${reservation_id}`;
+      const url = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${reservation_id}`;
+      console.log("[Cloudbeds] Fetching:", url);
+
+      const cbRes = await fetch(url, { headers });
+      if (!cbRes.ok) {
+        const errText = await cbRes.text();
+        console.error("[Cloudbeds] API error:", cbRes.status, errText);
+        throw new Error("Cloudbeds API request failed");
+      }
+
+      const cbData = await cbRes.json();
+      if (!cbData.success || !cbData.data) throw new Error("Reservation not found");
+      reservation = cbData.data;
     }
 
-    console.log("[Cloudbeds] Fetching:", url);
-
-    const cbRes = await fetch(url, { headers });
-    if (!cbRes.ok) {
-      const errText = await cbRes.text();
-      console.error("[Cloudbeds] API error:", cbRes.status, errText);
-      throw new Error("Cloudbeds API request failed");
-    }
-
-    const cbData = await cbRes.json();
-    if (!cbData.success || !cbData.data) {
-      throw new Error("Reservation not found");
-    }
-
-    // getReservations returns an array, getReservation returns an object
-    let reservation = cbData.data;
-    if (Array.isArray(reservation)) {
-      if (reservation.length === 0) throw new Error("Reservation not found");
-      reservation = reservation[0];
-    }
-
-    // If sub_reservation_id was used, find the matching sub-reservation
+    // Handle sub-reservation filtering
     let assigned = reservation.assigned || [];
     if (sub_reservation_id && assigned.length > 1) {
       const subMatch = assigned.find(
@@ -102,7 +143,6 @@ export default async function handler(req, res) {
 
     console.log("[Cloudbeds] Success:", result);
     return res.status(200).json(result);
-
   } catch (e) {
     console.error("[Cloudbeds] Error:", e);
     return res.status(500).json({
