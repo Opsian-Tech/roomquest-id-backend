@@ -1,4 +1,4 @@
-// verify.js - UPDATED (Fixes: OTA overwrite-to-null + get_session key mismatch)
+// verify.js - v2 UPDATED (Fixes: OTA overwrite-to-null + get_session key mismatch)
 // - Prevents verify_face from overwriting valid physical_room/room_access_code with null if Cloudbeds lookup fails
 // - Prefers cloudbeds_reservation_id for lookup when available (works for OTA thirdPartyIdentifier flows)
 // - get_session now returns BOTH snake_case and camelCase room access code keys for frontend compatibility
