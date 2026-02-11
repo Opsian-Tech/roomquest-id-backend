@@ -20,7 +20,7 @@ const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 /**
  * BUILD MARKER
  */
-const BUILD_ID = "cloudbeds-integration-v11";
+const BUILD_ID = "cloudbeds-integration-v12";
 
 if (!SUPABASE_URL) console.warn("Missing env: NEXT_PUBLIC_SUPABASE_URL");
 if (!SUPABASE_SERVICE_KEY) console.warn("Missing env: SUPABASE_SERVICE_KEY");
@@ -54,7 +54,7 @@ const textract = new TextractClient({
 async function fetchCloudbedsReservation(bookingRef) {
   console.log("[Cloudbeds] Fetching reservation:", bookingRef);
 
-// Try all possible reservation ID types
+  // Try all possible reservation ID types
   const lookups = [
     { reservation_id: bookingRef },
     { third_party_identifier: bookingRef },
@@ -135,6 +135,15 @@ function getGuestIsCheckedIn(cloudbeds) {
       return false;
   }
   return true;
+}
+
+/**
+ * Helper: check if the Cloudbeds reservation status is acceptable for check-in.
+ */
+function isStatusAcceptable(cloudbeds) {
+  return ["confirmed", "checked_in", "in_house"].includes(
+    String(cloudbeds?.status || "").toLowerCase()
+  );
 }
 
 async function streamToBuffer(readable) {
@@ -387,14 +396,11 @@ export default async function handler(req, res) {
         try {
           const cloudbeds = await fetchCloudbedsReservation(session.room_number);
 
-          // NEW — accept "confirmed" and "checked_in" statuses:
-    const guestIsCheckedIn = getGuestIsCheckedIn(cloudbeds);
-const statusOk = ["confirmed", "checked_in", "in_house"].includes(
-  String(cloudbeds?.status || "").toLowerCase()
-);
-if (!guestIsCheckedIn && !statusOk) {
-  return safeJson(res, 400, { error: "guest check in required" });
-}
+          // ✅ FIXED — accept "confirmed", "checked_in", "in_house" statuses
+          const guestIsCheckedIn = getGuestIsCheckedIn(cloudbeds);
+          if (!guestIsCheckedIn && !isStatusAcceptable(cloudbeds)) {
+            return safeJson(res, 400, { error: "guest check in required" });
+          }
 
           physical_room = cloudbeds.roomName || null;
           room_access_code = cloudbeds.accessCode || null;
@@ -515,14 +521,14 @@ if (!guestIsCheckedIn && !statusOk) {
     }
 
     // ============================================
-    // ACTION: update_guest (UPDATED)
+    // ACTION: update_guest (UPDATED — FIXED)
     // ============================================
     if (action === "update_guest") {
       const { session_token, guest_name, booking_ref, flow_type } = req.body || {};
 
       if (!session_token) return safeJson(res, 400, { error: "Session token required" });
       if (!guest_name) return safeJson(res, 400, { error: "Guest name required" });
-     if (flow_type !== "visitor" && !booking_ref) return safeJson(res, 400, { error: "Booking reference required" });
+      if (flow_type !== "visitor" && !booking_ref) return safeJson(res, 400, { error: "Booking reference required" });
 
       // ✅ Get the session's flow type first
       const { data: sess, error: sessErr } = await supabase
@@ -535,45 +541,44 @@ if (!guestIsCheckedIn && !statusOk) {
 
       const flowType = normalizeFlowType(sess.flow_type); // default guest
 
-    // ✅ For VISITOR flow, skip Cloudbeds entirely
-if (flowType === "visitor") {
-  const { error: updateErr } = await supabase
-    .from("demo_sessions")
-    .update({
-      guest_name,
-      room_number: "VISITOR",
-      flow_type: "visitor",
-      visitor_first_name: req.body.visitor_first_name || null,
-      visitor_last_name: req.body.visitor_last_name || null,
-      visitor_phone: req.body.visitor_phone || null,
-      visitor_reason: req.body.visitor_reason || null,
-      status: "guest_verified",
-      current_step: "document",
-      updated_at: new Date().toISOString(),
-    })
-    .eq("session_token", session_token);
+      // ✅ For VISITOR flow, skip Cloudbeds entirely
+      if (flowType === "visitor") {
+        const { error: updateErr } = await supabase
+          .from("demo_sessions")
+          .update({
+            guest_name,
+            room_number: "VISITOR",
+            flow_type: "visitor",
+            visitor_first_name: req.body.visitor_first_name || null,
+            visitor_last_name: req.body.visitor_last_name || null,
+            visitor_phone: req.body.visitor_phone || null,
+            visitor_reason: req.body.visitor_reason || null,
+            status: "guest_verified",
+            current_step: "document",
+            updated_at: new Date().toISOString(),
+          })
+          .eq("session_token", session_token);
 
-  if (updateErr) {
-    console.error("[verify.js] Error updating visitor info:", updateErr);
-    return safeJson(res, 500, { error: "Failed to save visitor info" });
-  }
+        if (updateErr) {
+          console.error("[verify.js] Error updating visitor info:", updateErr);
+          return safeJson(res, 500, { error: "Failed to save visitor info" });
+        }
 
-  return safeJson(res, 200, {
-    success: true,
-    guest_name,
-    room_number: "VISITOR",
-    flow_type: "visitor",
-  });
-}
-
+        return safeJson(res, 200, {
+          success: true,
+          guest_name,
+          room_number: "VISITOR",
+          flow_type: "visitor",
+        });
+      }
 
       // ✅ Only run Cloudbeds checks for GUEST flow
       try {
         const cloudbeds = await fetchCloudbedsReservation(booking_ref);
 
-        // ✅ Check reservation check-in status (only if backend provides it)
+        // ✅ FIXED — accept "confirmed", "checked_in", "in_house" statuses
         const guestIsCheckedIn = getGuestIsCheckedIn(cloudbeds);
-        if (!guestIsCheckedIn) {
+        if (!guestIsCheckedIn && !isStatusAcceptable(cloudbeds)) {
           return safeJson(res, 400, { error: "guest check in required" });
         }
 
