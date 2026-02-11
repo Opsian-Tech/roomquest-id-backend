@@ -4,7 +4,7 @@ const CLOUDBEDS_PROPERTY_ID = process.env.CLOUDBEDS_PROPERTY_EXTERNAL_ID;
 const CLOUDBEDS_API_BASE = "https://hotels.cloudbeds.com/api/v1.2";
 
 // ✅ change this string each deploy to prove you’re hitting the new code
-const BUILD_ID = "reservation-ota-fix-v1";
+const BUILD_ID = "reservation-ota-fix-v5";
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Credentials", "true");
