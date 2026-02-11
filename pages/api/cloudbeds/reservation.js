@@ -124,7 +124,7 @@ export default async function handler(req, res) {
 
     let accessCode = null;
     const customFields = reservation.customFields || [];
-    const doorCodeField = customFields.find((f) => f.customFieldName === "Door Code");
+    const doorCodeField = customFields.find((f) => f.customFieldName === "DOORCODE");
     if (doorCodeField) {
       accessCode = doorCodeField.customFieldValue;
     }
