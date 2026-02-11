@@ -1,5 +1,4 @@
-// pages/api/cloudbeds/reservation.js
-
+//UPDATED reservation.js
 const CLOUDBED_API_KEY = process.env.CLOUDBEDS_API_KEY;
 const CLOUDBEDS_PROPERTY_ID = process.env.CLOUDBEDS_PROPERTY_EXTERNAL_ID;
 const CLOUDBEDS_API_BASE = "https://hotels.cloudbeds.com/api/v1.2";
@@ -16,7 +15,6 @@ function setCors(res) {
 
 export default async function handler(req, res) {
   setCors(res);
-
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -25,91 +23,89 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Missing CLOUDBED_API_KEY" });
     }
 
-    const { reservation_id, third_party_identifier, sub_reservation_id } = req.body || {};
-
-    if (!reservation_id && !third_party_identifier && !sub_reservation_id) {
-      return res.status(400).json({ error: "Missing reservation identifier" });
-    }
+    const { 
+      reservation_id, 
+      third_party_identifier, 
+      sub_reservation_id,
+      source_reservation_id,
+      channel_reservation_id,
+      third_party_reservation_id,
+      ota_reservation_id
+    } = req.body || {};
 
     const headers = {
       Authorization: `Bearer ${CLOUDBED_API_KEY}`,
       "Content-Type": "application/json",
     };
 
-    let reservation;
+    let url;
+    let useReservationsEndpoint = false;
 
-    if (third_party_identifier) {
-      // Step 1: Search by third-party identifier (returns summary array)
-      const searchUrl = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${CLOUDBEDS_PROPERTY_ID}&thirdPartyIdentifier=${third_party_identifier}`;
-      console.log("[Cloudbeds] Step 1 - Searching by thirdPartyIdentifier:", searchUrl);
+    // Handle OTA identifiers (these all use getReservations plural endpoint)
+    const otaIdentifier = third_party_identifier || 
+                          source_reservation_id || 
+                          channel_reservation_id || 
+                          third_party_reservation_id || 
+                          ota_reservation_id;
 
-      const searchRes = await fetch(searchUrl, { headers });
-      if (!searchRes.ok) {
-        const errText = await searchRes.text();
-        console.error("[Cloudbeds] Search API error:", searchRes.status, errText);
-        throw new Error("Cloudbeds API request failed");
-      }
-
-      const searchData = await searchRes.json();
-      if (!searchData.success || !searchData.data) {
-        throw new Error("Reservation not found");
-      }
-
-      const results = Array.isArray(searchData.data) ? searchData.data : [searchData.data];
-      if (results.length === 0) throw new Error("Reservation not found");
-
-      const foundId = results[0].reservationID;
-      if (!foundId) throw new Error("Reservation found but missing reservationID");
-
-      console.log("[Cloudbeds] Step 2 - Fetching full details for reservationID:", foundId);
-
-      // Step 2: Get full reservation details using the found reservationID
-      const detailUrl = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${foundId}`;
-      const detailRes = await fetch(detailUrl, { headers });
-      if (!detailRes.ok) {
-        const errText = await detailRes.text();
-        console.error("[Cloudbeds] Detail API error:", detailRes.status, errText);
-        throw new Error("Failed to fetch full reservation details");
-      }
-
-      const detailData = await detailRes.json();
-      if (!detailData.success || !detailData.data) {
-        throw new Error("Failed to load reservation details");
-      }
-
-      reservation = detailData.data;
+    if (otaIdentifier) {
+      useReservationsEndpoint = true;
+      url = `${CLOUDBEDS_API_BASE}/getReservations?propertyID=${CLOUDBEDS_PROPERTY_ID}&thirdPartyIdentifier=${otaIdentifier}`;
     } else if (sub_reservation_id) {
       const mainId = sub_reservation_id.split("-")[0];
-      const url = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${mainId}`;
-      console.log("[Cloudbeds] Fetching:", url);
-
-      const cbRes = await fetch(url, { headers });
-      if (!cbRes.ok) {
-        const errText = await cbRes.text();
-        console.error("[Cloudbeds] API error:", cbRes.status, errText);
-        throw new Error("Cloudbeds API request failed");
-      }
-
-      const cbData = await cbRes.json();
-      if (!cbData.success || !cbData.data) throw new Error("Reservation not found");
-      reservation = cbData.data;
+      url = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${mainId}`;
+    } else if (reservation_id) {
+      url = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${reservation_id}`;
     } else {
-      const url = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${reservation_id}`;
-      console.log("[Cloudbeds] Fetching:", url);
-
-      const cbRes = await fetch(url, { headers });
-      if (!cbRes.ok) {
-        const errText = await cbRes.text();
-        console.error("[Cloudbeds] API error:", cbRes.status, errText);
-        throw new Error("Cloudbeds API request failed");
-      }
-
-      const cbData = await cbRes.json();
-      if (!cbData.success || !cbData.data) throw new Error("Reservation not found");
-      reservation = cbData.data;
+      return res.status(400).json({ error: "Missing reservation identifier" });
     }
 
-    // Handle sub-reservation filtering
+    console.log("[Cloudbeds] Fetching:", url);
+    const cbRes = await fetch(url, { headers });
+
+    if (!cbRes.ok) {
+      const errText = await cbRes.text();
+      console.error("[Cloudbeds] API error:", cbRes.status, errText);
+      throw new Error("Cloudbeds API request failed");
+    }
+
+    const cbData = await cbRes.json();
+
+    if (!cbData.success || !cbData.data) {
+      throw new Error("Reservation not found");
+    }
+
+    let reservation = cbData.data;
+    if (Array.isArray(reservation)) {
+      if (reservation.length === 0) throw new Error("Reservation not found");
+      reservation = reservation[0];
+    }
+
+    // ✅ NEW: If this was an OTA lookup, we need to fetch the actual Cloudbeds reservation
+    // to get the door code (which is stored as a custom field on the main reservation)
+    let doorCodeReservation = reservation;
+    
+    if (useReservationsEndpoint && reservation.reservationID) {
+      console.log("[Cloudbeds] OTA lookup successful, fetching main reservation for door code:", reservation.reservationID);
+      
+      try {
+        const doorCodeUrl = `${CLOUDBEDS_API_BASE}/getReservation?propertyID=${CLOUDBEDS_PROPERTY_ID}&reservationID=${reservation.reservationID}`;
+        const doorCodeRes = await fetch(doorCodeUrl, { headers });
+        
+        if (doorCodeRes.ok) {
+          const doorCodeData = await doorCodeRes.json();
+          if (doorCodeData.success && doorCodeData.data) {
+            doorCodeReservation = doorCodeData.data;
+            console.log("[Cloudbeds] Successfully fetched door code from main reservation");
+          }
+        }
+      } catch (doorCodeErr) {
+        console.warn("[Cloudbeds] Failed to fetch door code from main reservation:", doorCodeErr);
+        // Continue with original reservation data
+      }
+    }
+
+    // Handle sub-reservations
     let assigned = reservation.assigned || [];
     if (sub_reservation_id && assigned.length > 1) {
       const subMatch = assigned.find(
@@ -123,8 +119,9 @@ export default async function handler(req, res) {
       roomName = assigned[0].roomName || assigned[0].roomTypeName || null;
     }
 
+    // ✅ Extract door code from the correct reservation object
     let accessCode = null;
-    const customFields = reservation.customFields || [];
+    const customFields = doorCodeReservation.customFields || [];
     const doorCodeField = customFields.find((f) => f.customFieldName === "Door Code");
     if (doorCodeField) {
       accessCode = doorCodeField.customFieldValue;
@@ -139,10 +136,13 @@ export default async function handler(req, res) {
       checkInDate: reservation.startDate || null,
       checkOutDate: reservation.endDate || null,
       status: reservation.status || null,
+      // ✅ NEW: Include the original OTA identifier used for lookup
+      otaIdentifier: useReservationsEndpoint ? otaIdentifier : null,
     };
 
     console.log("[Cloudbeds] Success:", result);
     return res.status(200).json(result);
+    
   } catch (e) {
     console.error("[Cloudbeds] Error:", e);
     return res.status(500).json({
