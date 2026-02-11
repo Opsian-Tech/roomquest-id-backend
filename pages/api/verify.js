@@ -1,20 +1,13 @@
-// verify.fixed
-
-
-
-// verify.js - v2 UPDATED (Fixes: OTA overwrite-to-null + get_session key mismatch)
+// verify.js - v2 UPDATED (Fixes: OTA overwrite-to-null + get_session key mismatch + name mismatch bypass for checked-in)
 // - Prevents verify_face from overwriting valid physical_room/room_access_code with null if Cloudbeds lookup fails
 // - Prefers cloudbeds_reservation_id for lookup when available (works for OTA thirdPartyIdentifier flows)
-// - get_session now returns BOTH snake_case and camelCase room access code keys for frontend compatibility
+// - get_session returns BOTH snake_case and camelCase room access code keys for frontend compatibility
+// - update_guest: if name mismatch, allow bypass ONLY when Cloudbeds indicates guest is checked-in (prevents OTA/booker mismatch blocks)
 
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
-import {
-  RekognitionClient,
-  CompareFacesCommand,
-  DetectFacesCommand,
-} from "@aws-sdk/client-rekognition";
+import { RekognitionClient, CompareFacesCommand, DetectFacesCommand } from "@aws-sdk/client-rekognition";
 import { TextractClient, AnalyzeIDCommand } from "@aws-sdk/client-textract";
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -28,7 +21,7 @@ const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 /**
  * BUILD MARKER
  */
-const BUILD_ID = "cloudbeds-integration-v1-ota-fixed-v2";
+const BUILD_ID = "cloudbeds-integration-v1-ota-fixed-v3";
 
 if (!SUPABASE_URL) console.warn("Missing env: NEXT_PUBLIC_SUPABASE_URL");
 if (!SUPABASE_SERVICE_KEY) console.warn("Missing env: SUPABASE_SERVICE_KEY");
@@ -74,9 +67,6 @@ async function fetchCloudbedsReservation(bookingRef) {
     isPureDigits,
   });
 
-  // IMPORTANT:
-  // - If the user typed a Cloudbeds reservationID (alphanumeric), try reservation_id first.
-  // - If the user typed an OTA/source reservation id (often numeric), try OTA fields first so we don't waste calls.
   const lookupOrder = looksLikeCloudbedsId
     ? [
         { reservation_id: ref },
@@ -121,6 +111,8 @@ async function fetchCloudbedsReservation(bookingRef) {
           accessCode: data.accessCode,
           reservationId: data.reservationId,
           otaIdentifier: data.otaIdentifier,
+          guestIsCheckedIn: data.guestIsCheckedIn,
+          status: data.status,
         });
         return data;
       }
@@ -131,7 +123,6 @@ async function fetchCloudbedsReservation(bookingRef) {
 
   throw new Error("Reservation not found in Cloudbeds");
 }
-
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Credentials", "true");
@@ -165,8 +156,7 @@ function getGuestIsCheckedIn(cloudbeds) {
   if (typeof v === "string") {
     const s = v.trim().toLowerCase();
     if (["true", "yes", "y", "checkedin", "checked_in", "checked-in", "1"].includes(s)) return true;
-    if (["false", "no", "n", "notcheckedin", "not_checked_in", "not-checked-in", "0"].includes(s))
-      return false;
+    if (["false", "no", "n", "notcheckedin", "not_checked_in", "not-checked-in", "0"].includes(s)) return false;
   }
   return true; // backward-compatible default
 }
@@ -349,7 +339,6 @@ export default async function handler(req, res) {
 
           physical_room: session.physical_room ?? null,
 
-          // ✅ FIX: return BOTH keys to avoid camel/snake mismatch bugs
           room_access_code: session.room_access_code ?? null,
           roomAccessCode: session.room_access_code ?? null,
 
@@ -453,12 +442,10 @@ export default async function handler(req, res) {
       const requiresAdditionalGuest = verifiedAfter < expected;
       const overallVerified = verifiedAfter >= expected;
 
-      // ✅ FIX: default to existing DB values so we never overwrite with null on lookup failures
       let physical_room = session.physical_room ?? null;
       let room_access_code = session.room_access_code ?? null;
       let cloudbeds_reservation_id = session.cloudbeds_reservation_id ?? null;
 
-      // ✅ FIX: Prefer true Cloudbeds reservation id for lookup (works for OTA thirdPartyIdentifier flows)
       if (guest_verified && flow_type === "guest" && BACKEND_URL) {
         const lookupRef = session.cloudbeds_reservation_id || session.room_number;
 
@@ -471,15 +458,12 @@ export default async function handler(req, res) {
               return safeJson(res, 400, { error: "guest check in required" });
             }
 
-            // ✅ only overwrite if Cloudbeds returns values
             if (cloudbeds.roomName) physical_room = cloudbeds.roomName;
             if (cloudbeds.accessCode) room_access_code = cloudbeds.accessCode;
 
-            cloudbeds_reservation_id =
-              cloudbeds.reservationId || cloudbeds_reservation_id || String(lookupRef);
+            cloudbeds_reservation_id = cloudbeds.reservationId || cloudbeds_reservation_id || String(lookupRef);
           } catch (cbErr) {
             console.error("[Cloudbeds] Lookup failed (no overwrite):", cbErr?.message || cbErr);
-            // keep existing values
           }
         }
       }
@@ -594,208 +578,140 @@ export default async function handler(req, res) {
       return safeJson(res, 200, { success: true, message: "Consent logged successfully" });
     }
 
-   // ============================================
-// ACTION: update_guest (OTA-safe: always store real Cloudbeds reservationID)
-// ============================================
-if (action === "update_guest") {
-  const { session_token, guest_name, booking_ref, flow_type } = req.body || {};
+    // ============================================
+    // ACTION: update_guest (OTA-safe + checked-in name mismatch bypass)
+    // ============================================
+    if (action === "update_guest") {
+      const { session_token, guest_name, booking_ref, flow_type } = req.body || {};
 
-  if (!session_token) return safeJson(res, 400, { error: "Session token required" });
-  if (!guest_name) return safeJson(res, 400, { error: "Guest name required" });
-  if (flow_type !== "visitor" && !booking_ref)
-    return safeJson(res, 400, { error: "Booking reference required" });
+      if (!session_token) return safeJson(res, 400, { error: "Session token required" });
+      if (!guest_name) return safeJson(res, 400, { error: "Guest name required" });
+      if (flow_type !== "visitor" && !booking_ref) return safeJson(res, 400, { error: "Booking reference required" });
 
-  // Load session flow type from DB (authoritative)
-  const { data: sess, error: sessErr } = await supabase
-    .from("demo_sessions")
-    .select("flow_type")
-    .eq("session_token", session_token)
-    .single();
+      const { data: sess, error: sessErr } = await supabase
+        .from("demo_sessions")
+        .select("flow_type, intake_payload")
+        .eq("session_token", session_token)
+        .single();
 
-  if (sessErr || !sess) return safeJson(res, 404, { error: "Session not found" });
+      if (sessErr || !sess) return safeJson(res, 404, { error: "Session not found" });
 
-  const flowType = normalizeFlowType(sess.flow_type);
+      const flowType = normalizeFlowType(sess.flow_type);
 
-  // ==========================
-  // VISITOR FLOW (no Cloudbeds)
-  // ==========================
-  if (flowType === "visitor") {
-    const { error: updateErr } = await supabase
-      .from("demo_sessions")
-      .update({
-        guest_name,
-        room_number: "VISITOR",
-        flow_type: "visitor",
-        visitor_first_name: req.body.visitor_first_name || null,
-        visitor_last_name: req.body.visitor_last_name || null,
-        visitor_phone: req.body.visitor_phone || null,
-        visitor_reason: req.body.visitor_reason || null,
-        status: "guest_verified",
-        current_step: "document",
-        updated_at: new Date().toISOString(),
-      })
-      .eq("session_token", session_token);
+      // VISITOR FLOW
+      if (flowType === "visitor") {
+        const { error: updateErr } = await supabase
+          .from("demo_sessions")
+          .update({
+            guest_name,
+            room_number: "VISITOR",
+            flow_type: "visitor",
+            visitor_first_name: req.body.visitor_first_name || null,
+            visitor_last_name: req.body.visitor_last_name || null,
+            visitor_phone: req.body.visitor_phone || null,
+            visitor_reason: req.body.visitor_reason || null,
+            status: "guest_verified",
+            current_step: "document",
+            updated_at: new Date().toISOString(),
+          })
+          .eq("session_token", session_token);
 
-    if (updateErr) {
-      console.error("[verify.js] Error updating visitor info:", updateErr);
-      return safeJson(res, 500, { error: "Failed to save visitor info" });
-    }
-
-    return safeJson(res, 200, {
-      success: true,
-      guest_name,
-      room_number: "VISITOR",
-      flow_type: "visitor",
-    });
-  }
-
-  // ==========================
-  // GUEST FLOW (Cloudbeds)
-  // ==========================
-  try {
-    // First lookup using whatever user typed (Cloudbeds reservationID OR OTA ID)
-    const cloudbeds = await fetchCloudbedsReservation(booking_ref);
-
-    const inputName = (guest_name || "").trim();
-    const cbName = (cloudbeds.guestName || "").trim();
-
-    console.log(
-      "[verify.js] Name comparison - Input:",
-      JSON.stringify(inputName),
-      "Cloudbeds:",
-      JSON.stringify(cbName),
-      "booking_ref:",
-      booking_ref,
-      "cb.reservationId:",
-      cloudbeds?.reservationId
-    );
-
-    // If name mismatch, try a secondary lookup using REAL Cloudbeds reservation ID (if available)
-    if (!namesMatch(inputName, cbName)) {
-      const secondaryId =
-        cloudbeds?.reservationId && cloudbeds.reservationId !== booking_ref
-          ? cloudbeds.reservationId
-          : null;
-
-      if (secondaryId) {
-        console.log(
-          "[verify.js] Name mismatch on initial lookup. Trying secondary Cloudbeds reservation ID:",
-          secondaryId
-        );
-
-        try {
-          const cloudbedsSecondary = await fetchCloudbedsReservation(secondaryId);
-          const cbNameSecondary = (cloudbedsSecondary.guestName || "").trim();
-
-          console.log(
-            "[verify.js] Secondary lookup name:",
-            JSON.stringify(cbNameSecondary),
-            "secondaryId:",
-            secondaryId
-          );
-
-          if (namesMatch(inputName, cbNameSecondary)) {
-            console.log("[verify.js] Name matched on secondary lookup");
-
-            const guestIsCheckedInSecondary = getGuestIsCheckedIn(cloudbedsSecondary);
-            if (!guestIsCheckedInSecondary) {
-              return safeJson(res, 400, { error: "guest check in required" });
-            }
-
-            //  OTA-safe persistence:
-            // - room_number stores what the guest typed (OTA ID or reservation ID)
-            // - cloudbeds_reservation_id stores the REAL Cloudbeds reservation ID
-            const { error: updateErr } = await supabase
-              .from("demo_sessions")
-              .update({
-                guest_name,
-                room_number: String(booking_ref),
-
-                //  critical fix
-                cloudbeds_reservation_id: cloudbedsSecondary.reservationId || null,
-
-                physical_room: cloudbedsSecondary.roomName || null,
-                room_access_code: cloudbedsSecondary.accessCode || null,
-
-                status: "guest_verified",
-                current_step: "document",
-                updated_at: new Date().toISOString(),
-              })
-              .eq("session_token", session_token);
-
-            if (updateErr) {
-              console.error("[verify.js] Error updating guest info (secondary):", updateErr);
-              return safeJson(res, 500, { error: "Failed to save guest info" });
-            }
-
-            return safeJson(res, 200, {
-              success: true,
-              guest_name: cloudbedsSecondary.guestName,
-              room_number: cloudbedsSecondary.roomName,
-              reservation_id: cloudbedsSecondary.reservationId,
-              access_code: cloudbedsSecondary.accessCode,
-            });
-          }
-        } catch (secondaryErr) {
-          console.warn("[verify.js] Secondary Cloudbeds lookup failed:", secondaryErr);
+        if (updateErr) {
+          console.error("[verify.js] Error updating visitor info:", updateErr);
+          return safeJson(res, 500, { error: "Failed to save visitor info" });
         }
+
+        return safeJson(res, 200, {
+          success: true,
+          guest_name,
+          room_number: "VISITOR",
+          flow_type: "visitor",
+        });
       }
 
-      console.log("[verify.js] Name mismatch - Input:", inputName, "Cloudbeds:", cbName);
-      return safeJson(res, 400, {
-        error: "name_mismatch_reservation",
-        details: { provided: inputName, expected: cbName },
-      });
+      // GUEST FLOW
+      try {
+        const cloudbeds = await fetchCloudbedsReservation(booking_ref);
+
+        const inputName = String(guest_name || "").trim();
+        const cbName = String(cloudbeds.guestName || "").trim();
+        const resolvedRid = cloudbeds?.reservationId ? String(cloudbeds.reservationId) : null;
+
+        console.log(
+          "[verify.js] Name comparison - Input:",
+          JSON.stringify(inputName),
+          "Cloudbeds:",
+          JSON.stringify(cbName),
+          "booking_ref:",
+          booking_ref,
+          "cb.reservationId:",
+          resolvedRid
+        );
+
+        // If mismatch, allow ONLY when checked-in/in-house
+        if (!namesMatch(inputName, cbName)) {
+          const guestIsCheckedIn = getGuestIsCheckedIn(cloudbeds);
+          if (!guestIsCheckedIn) {
+            return safeJson(res, 400, {
+              error: "name_mismatch_reservation",
+              details: { provided: inputName, expected: cbName },
+            });
+          }
+          console.warn("[verify.js] Name mismatch bypass (checked-in). Provided:", inputName, "Expected:", cbName);
+        }
+
+        // Enforce checked-in gate (your current logic)
+        const guestIsCheckedIn = getGuestIsCheckedIn(cloudbeds);
+        if (!guestIsCheckedIn) {
+          return safeJson(res, 400, { error: "guest check in required" });
+        }
+
+        // Audit trail in intake_payload (non-breaking)
+        const intakePayload = {
+          ...(sess.intake_payload || {}),
+          provided_name: inputName,
+          cloudbeds_expected_name: cbName || null,
+          ota_identifier: String(booking_ref),
+          resolved_cloudbeds_reservation_id: resolvedRid,
+          cloudbeds_status: cloudbeds?.status || null,
+        };
+
+        const { error: updateErr } = await supabase
+          .from("demo_sessions")
+          .update({
+            guest_name,
+            room_number: String(booking_ref), // keep what user typed
+            cloudbeds_reservation_id: resolvedRid || null, // always store REAL Cloudbeds reservation ID
+            physical_room: cloudbeds.roomName || null,
+            room_access_code: cloudbeds.accessCode || null,
+            intake_payload: intakePayload,
+            status: "guest_verified",
+            current_step: "document",
+            updated_at: new Date().toISOString(),
+          })
+          .eq("session_token", session_token);
+
+        if (updateErr) {
+          console.error("[verify.js] Error updating guest info:", updateErr);
+          return safeJson(res, 500, { error: "Failed to save guest info" });
+        }
+
+        return safeJson(res, 200, {
+          success: true,
+          guest_name: cloudbeds.guestName,
+          room_number: cloudbeds.roomName,
+          reservation_id: resolvedRid,
+          access_code: cloudbeds.accessCode,
+        });
+      } catch (err) {
+        console.error("[verify.js] CloudBeds verification failed:", err);
+        return safeJson(res, 404, { error: "Reservation not found in CloudBeds" });
+      }
     }
 
-    // Check reservation check-in status
-    const guestIsCheckedIn = getGuestIsCheckedIn(cloudbeds);
-    if (!guestIsCheckedIn) {
-      return safeJson(res, 400, { error: "guest check in required" });
-    }
-
-    //  Primary persistence (works for BOTH direct reservationID and OTA):
-    // If this was OTA, cloudbeds.reservationId should be the Cloudbeds reservation ID (e.g., 490GYSS9MN)
-    const { error: updateErr } = await supabase
-      .from("demo_sessions")
-      .update({
-        guest_name,
-        room_number: String(booking_ref),
-
-        // critical fix (never store OTA id here)
-        cloudbeds_reservation_id: cloudbeds.reservationId || null,
-
-        physical_room: cloudbeds.roomName || null,
-        room_access_code: cloudbeds.accessCode || null,
-
-        status: "guest_verified",
-        current_step: "document",
-        updated_at: new Date().toISOString(),
-      })
-      .eq("session_token", session_token);
-
-    if (updateErr) {
-      console.error("[verify.js] Error updating guest info:", updateErr);
-      return safeJson(res, 500, { error: "Failed to save guest info" });
-    }
-
-    return safeJson(res, 200, {
-      success: true,
-      guest_name: cloudbeds.guestName,
-      room_number: cloudbeds.roomName,
-      reservation_id: cloudbeds.reservationId,
-      access_code: cloudbeds.accessCode,
-    });
-  } catch (err) {
-    console.error("[verify.js] CloudBeds verification failed:", err);
-    return safeJson(res, 404, { error: "Reservation not found in CloudBeds" });
-  }
-}
-
-// ============================================
-// ACTION: visitor_intake
-// ============================================
-
+    // ============================================
+    // ACTION: visitor_intake
+    // ============================================
     if (action === "visitor_intake") {
       const { session_token, first_name, last_name, phone, reason } = req.body || {};
       if (!session_token) return safeJson(res, 400, { error: "Session token required" });
@@ -850,7 +766,6 @@ if (action === "update_guest") {
       const verifiedBefore = clampInt(sess.verified_guest_count, 0, 10);
       const guestIndex = flowType === "visitor" ? 1 : clampInt(verifiedBefore + 1, 1, expected || 1);
 
-      // Textract name validation (guest flow only)
       if (flowType === "guest" && sess.guest_name) {
         try {
           console.log("[verify.js] Running Textract ID analysis...");
@@ -890,7 +805,6 @@ if (action === "update_guest") {
           console.log("[verify.js] Document name validation passed");
         } catch (textractErr) {
           console.error("[verify.js] Textract analysis failed:", textractErr);
-          // continue without hard failing
         }
       }
 
@@ -907,7 +821,6 @@ if (action === "update_guest") {
 
       const documentUrl = `s3://${BUCKET}/${s3Key}`;
 
-      // Visitor flow: generate 6-digit access code
       if (flowType === "visitor") {
         const accessCode = generateSixDigitCode();
         const grantedAt = new Date();
@@ -940,7 +853,6 @@ if (action === "update_guest") {
         });
       }
 
-      // Guest flow: proceed
       const { error: updateErr } = await supabase
         .from("demo_sessions")
         .update({
